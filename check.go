@@ -172,11 +172,8 @@ type StatementChecker func(query string) (Op, bool)
 
 // runStatementCheckers reports a Violation for each registered checker that
 // recognizes query as an external call, when a transaction is open in the ctx
-// scope.
+// scope. Callers guard with len(d.stmtCheckers) != 0.
 func (d *Detector) runStatementCheckers(ctx context.Context, query string) {
-	if len(d.stmtCheckers) == 0 {
-		return
-	}
 	s := scopeFrom(ctx)
 	if s == nil {
 		return

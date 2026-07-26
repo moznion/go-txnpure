@@ -124,8 +124,11 @@ func (c *wrappedConn) observe(ctx context.Context, query string) {
 	}
 	// User-declared external calls are checked against every open transaction
 	// in the scope (including this connection's own), independently of the
-	// tx-lifecycle/write classification above.
-	c.det.runStatementCheckers(ctx, query)
+	// tx-lifecycle/write classification above. The len check is hoisted here
+	// so the common no-checker case pays no function call per statement.
+	if len(c.det.stmtCheckers) != 0 {
+		c.det.runStatementCheckers(ctx, query)
+	}
 }
 
 // reportIfCrossConn reports a cross-connection-write Violation when a write on
