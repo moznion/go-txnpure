@@ -167,6 +167,25 @@ cross-connection, RoundTripper-in-tx, and unscoped-tx. Tests skip unless
 Docker) and exports it. DDL setup runs with no scope so it never trips a
 checkpoint. CI uses one PostgreSQL major (no version-specific behavior).
 
+## Performance guardrails
+
+The always-on hot paths (classifier, driver observe, checkpoint fast path)
+must stay allocation-free; StartScope has a fixed 3-alloc budget. Two gates
+enforce this — when a change trips one, fix the regression rather than
+loosening the gate (loosen only with justification in the PR):
+
+- `TestHotPathAllocations` pins exact allocs/op via `testing.AllocsPerRun`.
+  It self-skips under `-race` (the race runtime allocates), so CI runs it in
+  a separate no-race step; `make test` runs both.
+- The `benchmark` CI job (PRs only) benches head and base back to back on
+  one runner and compares with `internal/benchgate` (root-module package,
+  stdlib only): any allocs/op or B/op increase fails; median ns/op beyond
+  +25% past a 5ns absolute floor fails. Head-only benchmarks are
+  informational, so adding benchmarks bootstraps cleanly.
+- `bench_test.go` is the suite (`make bench`); cover any new hot path there,
+  and mind `Classifier`/`StatementChecker` purity — prepared statements
+  evaluate both once at prepare time.
+
 ## Roadmap state
 
 M0–M3 of DESIGN.md §6 are implemented (core, governance, grpc, examples,
