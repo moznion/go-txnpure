@@ -71,7 +71,10 @@ see DESIGN.md for the full design log.
   `foreign`), because an external effect embedded in a statement is not
   rollback-safe even inside its own tx. Non-SQL clients have no Go hook →
   `Check`/`Do` adapters remain their extension point (Op is already
-  free-form). Matchers run on the hot path — keep them cheap.
+  free-form). Matchers run on the hot path — keep them cheap. Classifier and
+  StatementChecker must be pure functions of the query: the prepared-statement
+  path evaluates both once at prepare time and reuses the results per
+  execution (`wrappedStmt.kind` / `wrappedStmt.stmtOps`).
 - **No panicking reporter**: test-failure ergonomics are `Require*`
   assertions + stack traces in violations (`stack.go`, default depth 32,
   `WithStackDepth(0)` disables). Stack capture skips leading txnpure-internal

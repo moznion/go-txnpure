@@ -41,7 +41,9 @@ func (k StatementKind) String() string {
 	}
 }
 
-// Classifier decides the StatementKind of a raw SQL string.
+// Classifier decides the StatementKind of a raw SQL string. It must be a
+// pure function of the query: for prepared statements it is evaluated once at
+// prepare time and the result is reused for every execution.
 type Classifier func(query string) StatementKind
 
 // DefaultClassifier classifies a statement by its leading keyword, skipping

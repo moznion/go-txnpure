@@ -111,7 +111,21 @@ func (c *wrappedConn) closeTx() {
 // issued on this connection while a transaction opened on a *different*
 // connection in the same scope is still open (§4.11 of DESIGN.md).
 func (c *wrappedConn) observe(ctx context.Context, query string) {
-	switch c.det.classify(query) {
+	c.observeKind(ctx, query, c.det.classify(query))
+	// User-declared external calls are checked against every open transaction
+	// in the scope (including this connection's own), independently of the
+	// tx-lifecycle/write classification above. The len check is hoisted here
+	// so the common no-checker case pays no function call per statement.
+	if len(c.det.stmtCheckers) != 0 {
+		c.det.runStatementCheckers(ctx, query)
+	}
+}
+
+// observeKind is observe with the classification already known — the prepared
+// statement path classifies once at prepare time and reuses the result for
+// every execution.
+func (c *wrappedConn) observeKind(ctx context.Context, query string, kind StatementKind) {
+	switch kind {
 	case KindBegin:
 		if c.txID == 0 {
 			c.openTx(ctx)
@@ -121,13 +135,6 @@ func (c *wrappedConn) observe(ctx context.Context, query string) {
 	case KindWrite:
 		c.reportIfCrossConn(ctx, query)
 	case KindOther:
-	}
-	// User-declared external calls are checked against every open transaction
-	// in the scope (including this connection's own), independently of the
-	// tx-lifecycle/write classification above. The len check is hoisted here
-	// so the common no-checker case pays no function call per statement.
-	if len(c.det.stmtCheckers) != 0 {
-		c.det.runStatementCheckers(ctx, query)
 	}
 }
 
@@ -162,7 +169,7 @@ func (c *wrappedConn) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &wrappedStmt{conn: c, stmt: stmt, query: query}, nil
+	return c.wrapStmt(stmt, query), nil
 }
 
 func (c *wrappedConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
@@ -171,9 +178,22 @@ func (c *wrappedConn) PrepareContext(ctx context.Context, query string) (driver.
 		if err != nil {
 			return nil, err
 		}
-		return &wrappedStmt{conn: c, stmt: stmt, query: query}, nil
+		return c.wrapStmt(stmt, query), nil
 	}
 	return c.Prepare(query)
+}
+
+// wrapStmt classifies the query and runs the statement checkers once, so
+// repeated executions of a prepared statement reuse both results (Classifier
+// and StatementChecker are pure functions of the query).
+func (c *wrappedConn) wrapStmt(stmt driver.Stmt, query string) *wrappedStmt {
+	s := &wrappedStmt{conn: c, stmt: stmt, query: query, kind: c.det.classify(query)}
+	for _, chk := range c.det.stmtCheckers {
+		if op, ok := chk(query); ok {
+			s.stmtOps = append(s.stmtOps, op)
+		}
+	}
+	return s
 }
 
 func (c *wrappedConn) Close() error { return c.conn.Close() }
@@ -323,9 +343,21 @@ func (t *wrappedTx) Rollback() error {
 }
 
 type wrappedStmt struct {
-	conn  *wrappedConn
-	stmt  driver.Stmt
-	query string
+	conn    *wrappedConn
+	stmt    driver.Stmt
+	query   string
+	kind    StatementKind // classified once at prepare time
+	stmtOps []Op          // statement-checker matches, computed once at prepare time
+}
+
+// observe is the per-execution observation for a prepared statement: the
+// transaction-lifecycle/write handling uses the prepare-time classification,
+// and prepare-time checker matches are reported against the ctx scope.
+func (s *wrappedStmt) observe(ctx context.Context) {
+	s.conn.observeKind(ctx, s.query, s.kind)
+	if len(s.stmtOps) != 0 {
+		s.conn.det.reportStatementOps(ctx, s.stmtOps)
+	}
 }
 
 var (
@@ -343,7 +375,7 @@ func (s *wrappedStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if errors.Is(err, driver.ErrBadConn) {
 		return nil, err
 	}
-	s.conn.observe(context.Background(), s.query)
+	s.observe(context.Background())
 	return res, err
 }
 
@@ -352,7 +384,7 @@ func (s *wrappedStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 	if errors.Is(err, driver.ErrBadConn) {
 		return nil, err
 	}
-	s.conn.observe(ctx, s.query)
+	s.observe(ctx)
 	return res, err
 }
 
@@ -372,7 +404,7 @@ func (s *wrappedStmt) Query(args []driver.Value) (driver.Rows, error) {
 	if errors.Is(err, driver.ErrBadConn) {
 		return nil, err
 	}
-	s.conn.observe(context.Background(), s.query)
+	s.observe(context.Background())
 	return rows, err
 }
 
@@ -381,7 +413,7 @@ func (s *wrappedStmt) QueryContext(ctx context.Context, args []driver.NamedValue
 	if errors.Is(err, driver.ErrBadConn) {
 		return nil, err
 	}
-	s.conn.observe(ctx, s.query)
+	s.observe(ctx)
 	return rows, err
 }
 

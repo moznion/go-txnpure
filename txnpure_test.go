@@ -121,6 +121,48 @@ func TestTextualBeginCommit(t *testing.T) {
 	}
 }
 
+// Textual BEGIN/COMMIT executed through prepared statements must drive the
+// transaction state exactly like the direct-exec path (the classification is
+// cached at prepare time).
+func TestTextualBeginCommitViaPreparedStmt(t *testing.T) {
+	det, rep, db := setup(t)
+	ctx, finish := det.StartScope(context.Background(), "CreateUser")
+	defer finish()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	begin, err := conn.PrepareContext(ctx, "BEGIN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = begin.Close() }()
+	commit, err := conn.PrepareContext(ctx, "COMMIT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = commit.Close() }()
+
+	if _, err := begin.ExecContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	det.Check(ctx, opHTTP)
+	if got := len(rep.Violations()); got != 1 {
+		t.Fatalf("after prepared BEGIN: got %d violations, want 1", got)
+	}
+
+	if _, err := commit.ExecContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	det.Check(ctx, opHTTP)
+	if got := len(rep.Violations()); got != 1 {
+		t.Errorf("after prepared COMMIT: got %d violations, want still 1", got)
+	}
+}
+
 func TestSavepointStatementsKeepTxOpen(t *testing.T) {
 	det, rep, db := setup(t)
 	ctx, finish := det.StartScope(context.Background(), "CreateUser")

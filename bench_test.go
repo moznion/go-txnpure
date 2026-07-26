@@ -184,6 +184,20 @@ func BenchmarkNullDBEndToEnd(b *testing.B) {
 			}
 		}
 	})
+	b.Run("prepared_stmt_exec_with_cte", func(b *testing.B) {
+		stmt, err := db.PrepareContext(ctx,
+			"with recent as (select * from orders where ts > $1 and status in ('a','b','c')) select count(*) from recent")
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer func() { _ = stmt.Close() }()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := stmt.ExecContext(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 	b.Run("tx_begin_commit", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {

@@ -167,7 +167,9 @@ func (d *Detector) emitViolation(ctx context.Context, s *scope, op Op, open int,
 //
 // Matchers run on the statement hot path (only while a transaction is open in
 // the scope), so keep them cheap — a leading-keyword or substring test, not a
-// full SQL parse.
+// full SQL parse. A checker must be a pure function of the query: for
+// prepared statements it is evaluated once at prepare time and the match is
+// reused for every execution.
 type StatementChecker func(query string) (Op, bool)
 
 // runStatementCheckers reports a Violation for each registered checker that
@@ -186,5 +188,23 @@ func (d *Detector) runStatementCheckers(ctx context.Context, query string) {
 		if op, ok := chk(query); ok {
 			d.emitViolation(ctx, s, op, open, nil)
 		}
+	}
+}
+
+// reportStatementOps is runStatementCheckers for the prepared-statement path:
+// the checker matches were computed once at prepare time (checkers are pure
+// functions of the query), so each execution only consults the scope counter
+// and reports the pre-matched ops. Callers guard with len(ops) != 0.
+func (d *Detector) reportStatementOps(ctx context.Context, ops []Op) {
+	s := scopeFrom(ctx)
+	if s == nil {
+		return
+	}
+	open := int(s.openTxs.Load())
+	if open <= 0 {
+		return
+	}
+	for _, op := range ops {
+		d.emitViolation(ctx, s, op, open, nil)
 	}
 }
