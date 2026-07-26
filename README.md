@@ -386,7 +386,20 @@ make fmt    # gofmt -s + goimports
 make lint   # golangci-lint
 make test   # go test -race, plus the no-race allocation-budget test
 make bench  # the benchmark suite, local only (compare runs with internal/benchgate)
+make fuzz   # the fuzz targets, 30s each (FUZZTIME=10m for a soak)
 ```
+
+txnpure sits on an always-on path — every statement, every outgoing request —
+so a panic in it would take down a process for a problem it only observes. The
+fuzz suite (`fuzz_test.go`) therefore covers the statement classifier and
+table-name extraction, arbitrary sequences of statements/transactions/
+checkpoints through the driver wrapper (the scope's open-transaction counter
+must never go negative, exceed the number of connections, or stay stuck high),
+a `WithClassifier` returning arbitrary kinds, prepared-statement vs. direct
+execution parity, the baseline file parser, and arbitrary identity strings
+through the reporting pipeline. Seed corpora run as part of `go test ./...`,
+and CI runs a short generative pass on every PR; a failing input is written to
+`testdata/fuzz/` and committed as a regression seed.
 
 Before committing, `gofmt -l .` must be empty, `golangci-lint run` clean, and
 `go test -race ./...` green. CI enforces all three on the root, the `grpc/`

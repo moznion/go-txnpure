@@ -189,6 +189,38 @@ rather than loosening the gate (loosen only with justification in the PR):
   B/op increase fails; median ns/op beyond +25% past a 5ns absolute floor
   fails; head-only benchmarks are informational.
 
+## Fuzzing (crash safety)
+
+txnpure runs on the always-on path of an application, so a panic in it takes
+the host process down for a problem txnpure only *observes*: crash-freedom on
+arbitrary input outranks every other property. `fuzz_test.go` (package
+`txnpure`, so targets can read `scope.openTxs`) is the suite; `make fuzz`
+drives every target one at a time (`FUZZTIME=10m` for a soak), and the `fuzz`
+CI job runs a short generative pass per PR. Seed corpora replay in the normal
+`go test ./...`, so committed inputs are permanent regression tests.
+
+- Targets and the invariants they pin: `FuzzWriteTarget` (determinism, bounded
+  op name), `FuzzDriverSequence` (an arbitrary op/statement/transaction stream:
+  `openTxs` stays in `[0, conns]` at every step and drains to 0),
+  `FuzzAdversarialClassifier` (same, with a `WithClassifier` returning
+  arbitrary — including out-of-range — kinds; a user escape hatch must not be
+  able to poison the counter), `FuzzPreparedStatementParity` (the
+  prepare-time caching of classification + checker matches must report exactly
+  what the direct path reports), `FuzzLoadBaseline` (hand-edited file: error,
+  never panic; stable Save/Load round trip), `FuzzViolationPipeline` (arbitrary
+  identity strings through allowlist → baseline → throttling → rendering, with
+  the suppression contract intact), plus
+  `FuzzDefaultClassifierMatchesReference` in `classify_internal_test.go`
+  (differential against `referenceClassifier`, its readable specification).
+- **A failing input is committed**, not just fixed: `go test -fuzz` writes it
+  to `testdata/fuzz/<Target>/<hash>`; the CI job prints it on failure so the
+  reproducer survives the runner.
+- Helpers the targets install (`adversarialClassifier`,
+  `fuzzStatementChecker`) must stay **pure functions of the query** like the
+  real hooks, or the prepared-statement parity target compares two different
+  things. Bound the work per input (the op stream is truncated) so fuzzing
+  stays throughput-bound.
+
 ## Roadmap state
 
 M0–M3 of DESIGN.md §6 are implemented (core, governance, grpc, examples,
