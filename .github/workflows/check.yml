@@ -33,6 +33,27 @@ jobs:
         # so run it again without -race to make it actually gate.
         run: go test -count=1 -run TestHotPathAllocations .
 
+  fuzz:
+    # Crash-safety gate: txnpure runs on the always-on path of an application,
+    # so a panic in the classifier, the driver wrapper or a reporter takes the
+    # host process down for a problem txnpure only observes. The seed corpora
+    # already run in the test job; this job is the generative pass, with a
+    # short per-target budget so it stays a PR-time check rather than a soak.
+    # Longer runs are `make fuzz FUZZTIME=10m` locally.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: Fuzz
+        run: make fuzz FUZZTIME=30s
+      - name: Show the failing input
+        # go test writes it to testdata/fuzz/<Target>/<hash>; print it so the
+        # reproducer survives the job, then commit it as a regression seed.
+        if: failure()
+        run: find testdata/fuzz -type f -print -exec cat {} \; 2>/dev/null || true
+
   grpc:
     runs-on: ubuntu-latest
     strategy:
