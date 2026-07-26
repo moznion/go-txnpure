@@ -81,8 +81,8 @@ func (d *Detector) check(ctx context.Context, op Op, opts []CheckOption) {
 		return
 	}
 	var cfg checkConfig
-	for _, o := range opts {
-		o(&cfg)
+	if len(opts) != 0 {
+		cfg = appliedCheckConfig(opts)
 	}
 	open := int(s.openTxs.Load())
 	if open <= 0 {
@@ -102,6 +102,30 @@ func (d *Detector) check(ctx context.Context, op Op, opts []CheckOption) {
 		return
 	}
 	d.emitViolation(ctx, s, op, open, cfg.attrs)
+}
+
+// appliedCheckConfig folds opts into a config. Kept out of check so that the
+// zero-option path never heap-allocates the config: handing &cfg to the
+// option closures forces cfg to escape, and check runs on every checkpoint.
+func appliedCheckConfig(opts []CheckOption) checkConfig {
+	var cfg checkConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
+}
+
+// checkNeeded reports whether an option-less checkpoint on ctx could produce
+// any report, so adapters (WrapRoundTripper) can skip deriving the Op name on
+// the per-request fast path. It mirrors check(): with no scope only
+// unscoped-check detection would report, and a scope with no open transaction
+// reports nothing when no AllowInTransaction is in play (StaleAllow needs it)
+// — so it must not gate checkpoints that pass options.
+func (d *Detector) checkNeeded(ctx context.Context) bool {
+	if s := scopeFrom(ctx); s != nil {
+		return s.openTxs.Load() > 0
+	}
+	return d.reportUnscopedCheck
 }
 
 // emitViolation assembles a Violation (allowlist filter, attrs merge, stack
