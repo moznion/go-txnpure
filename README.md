@@ -300,6 +300,58 @@ Opt-in signals (never Violations):
   was still open (forgotten Commit/Rollback).
 - `WithNestedScopeDetection()` — overlapping instrumentation layers.
 
+## Performance
+
+txnpure is meant to stay enabled everywhere — unit tests, real-database
+tests, and production — so the paths that run when nothing is wrong are
+engineered to be allocation-free and cheap:
+
+| Always-on path | Cost (indicative)¹ |
+| --- | --- |
+| Classify a statement (`DefaultClassifier`) | ~5–12 ns, **0 allocs** |
+| Driver observation per statement | ~7–13 ns, **0 allocs** |
+| `Check` with a scope and no open transaction | ~4 ns, **0 allocs** |
+| `Check` with no scope on the context | ~2 ns, **0 allocs** |
+| Wrapped `RoundTrip` with no open transaction | ~2 ns on top of the request, **0 allocs** |
+| Driver-level begin+commit (txnpure's share) | **0 allocs** |
+| `StartScope` + finish | ~45 ns, 3 allocs (scope holder, context value, finish closure) |
+
+¹ Apple M-series laptop; run `go test -bench . -benchmem` for your hardware.
+
+Costs you pay only when something is actually reported:
+
+- **Stack capture on a Violation** (default depth 32) is ~1.7 µs and ~2 KB
+  per report, and it happens before any throttling. If a production service
+  can produce sustained violations, lower `WithStackDepth` — `0` disables
+  capture entirely and makes even the reporting path allocation-free
+  (reporter internals aside).
+
+Design notes that keep the hot path cheap — and what they ask of you:
+
+- **Prepared statements are classified once at prepare time**, and statement
+  checkers are matched once there too; executions reuse the results. This is
+  why `Classifier` and `StatementChecker` must be pure functions of the query
+  string.
+- **`StatementChecker`s run per statement on the direct-exec path** (only
+  consulted while relevant): keep them to a leading-keyword or substring
+  test, never a full SQL parse.
+- **`Check` walks the context chain** to find the scope, so its cost grows by
+  roughly a nanosecond per `context.WithValue` layer between the scope and
+  the checkpoint. Ordinary middleware stacks are fine; just avoid putting the
+  scope hundreds of layers away from the side-effect call sites.
+
+Two CI gates protect against regressions:
+
+- `TestHotPathAllocations` pins the exact allocation budget of every path
+  above with `testing.AllocsPerRun` — deterministic, so any new allocation
+  fails CI outright (it skips under `-race`; CI runs it in a separate
+  no-race step).
+- The `benchmark` CI job runs the benchmark suite on a PR's head and base
+  back to back on the same runner and compares them with
+  `internal/benchgate`: any `allocs/op` or `B/op` increase fails, and a
+  median `ns/op` regression beyond +25% (past a 5 ns absolute floor,
+  which keeps nanosecond-scale benchmarks from flaking) fails.
+
 ## Blind spots (accepted, documented)
 
 - **Detached contexts**: a side effect (or transaction) running on
@@ -326,7 +378,8 @@ modules; the children `replace` the root to keep it zero-dependency. Dev tools
 ```console
 make fmt    # gofmt -s + goimports
 make lint   # golangci-lint
-make test   # go test -race
+make test   # go test -race, plus the no-race allocation-budget test
+make bench  # the benchmark suite (compare runs with internal/benchgate)
 ```
 
 Before committing, `gofmt -l .` must be empty, `golangci-lint run` clean, and

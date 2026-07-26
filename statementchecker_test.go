@@ -130,6 +130,46 @@ func TestStatementCheckerAllowlisted(t *testing.T) {
 	}
 }
 
+// A prepared statement carries its checker match across executions: the match
+// is computed once at prepare time, and each execution is judged against the
+// transaction state at that moment.
+func TestStatementCheckerPreparedStmt(t *testing.T) {
+	det, rep, db := setup(t, txnpure.WithStatementChecker(notifyChecker))
+	ctx, finish := det.StartScope(context.Background(), "CreateUser")
+	defer finish()
+
+	stmt, err := db.PrepareContext(ctx, "SELECT pg_notify('ch', 'msg')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	// Outside any transaction: clean.
+	if _, err := stmt.ExecContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rep.RequireNoViolations(t)
+
+	// The same prepared statement inside a transaction: violation.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Commit() }()
+	txStmt := tx.StmtContext(ctx, stmt)
+	defer func() { _ = txStmt.Close() }()
+	if _, err := txStmt.ExecContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	vs := rep.Violations()
+	if len(vs) != 1 {
+		t.Fatalf("got %d violations, want 1", len(vs))
+	}
+	if vs[0].Op != (txnpure.Op{Kind: "notify", Name: "pg_notify"}) {
+		t.Errorf("Op = %+v, want {notify pg_notify}", vs[0].Op)
+	}
+}
+
 // With no checkers registered, the mechanism adds nothing.
 func TestNoStatementCheckersIsInert(t *testing.T) {
 	det, rep, db := setup(t)

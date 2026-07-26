@@ -39,7 +39,12 @@ type wrappedRoundTripper struct {
 }
 
 func (w *wrappedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	w.det.Check(req.Context(), Op{Kind: "http", Name: w.name(req)})
+	ctx := req.Context()
+	// Deriving the op name concatenates strings and this runs on every
+	// outgoing request, so skip it (and the Check) when no report can result.
+	if w.det.checkNeeded(ctx) {
+		w.det.Check(ctx, Op{Kind: "http", Name: w.name(req)})
+	}
 	return w.rt.RoundTrip(req)
 }
 

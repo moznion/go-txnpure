@@ -41,7 +41,9 @@ func (k StatementKind) String() string {
 	}
 }
 
-// Classifier decides the StatementKind of a raw SQL string.
+// Classifier decides the StatementKind of a raw SQL string. It must be a
+// pure function of the query: for prepared statements it is evaluated once at
+// prepare time and the result is reused for every execution.
 type Classifier func(query string) StatementKind
 
 // DefaultClassifier classifies a statement by its leading keyword, skipping
@@ -60,29 +62,107 @@ type Classifier func(query string) StatementKind
 //     WithClassifier if this matters for your queries.
 //   - Everything else (SELECT/SHOW/EXPLAIN/SET/...) is KindOther.
 func DefaultClassifier(query string) StatementKind {
-	switch firstToken(query) {
-	case "BEGIN", "START":
-		return KindBegin
-	case "COMMIT", "END":
-		return KindCommit
-	case "ROLLBACK", "ABORT":
-		// ROLLBACK TO [SAVEPOINT] does not end the transaction.
-		if secondToken(query) == "TO" {
-			return KindOther
-		}
-		return KindRollback
-	case "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "REPLACE", "UPSERT", "COPY", "IMPORT",
-		"CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT", "REFRESH",
-		"CALL", "DO":
-		return KindWrite
-	case "WITH":
-		if containsWriteToken(query) {
-			return KindWrite
-		}
-		return KindOther
-	default:
+	// This runs on every statement executed through a wrapped driver, so it
+	// must not allocate: keywords are matched with ASCII case folding
+	// (tokenIs) instead of strings.ToUpper, dispatched on the first byte.
+	q := stripLeading(query)
+	tok := q[:identRunLen(q)]
+	if tok == "" {
 		return KindOther
 	}
+	switch tok[0] | 0x20 { // ASCII-lowercased first byte
+	case 'b':
+		if tokenIs(tok, "BEGIN") {
+			return KindBegin
+		}
+	case 's':
+		if tokenIs(tok, "START") {
+			return KindBegin
+		}
+	case 'c':
+		if tokenIs(tok, "COMMIT") {
+			return KindCommit
+		}
+		if tokenIs(tok, "CREATE") || tokenIs(tok, "CALL") || tokenIs(tok, "COPY") || tokenIs(tok, "COMMENT") {
+			return KindWrite
+		}
+	case 'e':
+		if tokenIs(tok, "END") {
+			return KindCommit
+		}
+	case 'r':
+		if tokenIs(tok, "ROLLBACK") {
+			return rollbackKind(q[len(tok):])
+		}
+		if tokenIs(tok, "REPLACE") || tokenIs(tok, "REVOKE") || tokenIs(tok, "REFRESH") {
+			return KindWrite
+		}
+	case 'a':
+		if tokenIs(tok, "ABORT") {
+			return rollbackKind(q[len(tok):])
+		}
+		if tokenIs(tok, "ALTER") {
+			return KindWrite
+		}
+	case 'i':
+		if tokenIs(tok, "INSERT") || tokenIs(tok, "IMPORT") {
+			return KindWrite
+		}
+	case 'u':
+		if tokenIs(tok, "UPDATE") || tokenIs(tok, "UPSERT") {
+			return KindWrite
+		}
+	case 'd':
+		if tokenIs(tok, "DELETE") || tokenIs(tok, "DROP") || tokenIs(tok, "DO") {
+			return KindWrite
+		}
+	case 'm':
+		if tokenIs(tok, "MERGE") {
+			return KindWrite
+		}
+	case 't':
+		if tokenIs(tok, "TRUNCATE") {
+			return KindWrite
+		}
+	case 'g':
+		if tokenIs(tok, "GRANT") {
+			return KindWrite
+		}
+	case 'w':
+		if tokenIs(tok, "WITH") && containsWriteToken(q[len(tok):]) {
+			return KindWrite
+		}
+	}
+	return KindOther
+}
+
+// rollbackKind distinguishes ROLLBACK TO [SAVEPOINT] — which rewinds inside
+// the transaction without ending it (KindOther) — from a plain ROLLBACK /
+// ABORT (KindRollback). rest is the query after the leading keyword.
+func rollbackKind(rest string) StatementKind {
+	rest = stripLeading(rest)
+	if tokenIs(rest[:identRunLen(rest)], "TO") {
+		return KindOther
+	}
+	return KindRollback
+}
+
+// tokenIs reports whether tok equals kw under ASCII case folding, without
+// allocating. kw must be uppercase ASCII.
+func tokenIs(tok, kw string) bool {
+	if len(tok) != len(kw) {
+		return false
+	}
+	for i := 0; i < len(kw); i++ {
+		c := tok[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != kw[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // writeTarget extracts a best-effort table name from a write statement, for
@@ -121,7 +201,11 @@ func writeTarget(query string) string {
 // and "/* */" block comments).
 func stripLeading(q string) string {
 	for {
-		q = strings.TrimLeft(q, " \t\r\n")
+		i := 0
+		for i < len(q) && (q[i] == ' ' || q[i] == '\t' || q[i] == '\r' || q[i] == '\n') {
+			i++
+		}
+		q = q[i:]
 		if strings.HasPrefix(q, "--") {
 			idx := strings.IndexByte(q, '\n')
 			if idx < 0 {
@@ -157,19 +241,13 @@ func firstToken(q string) string {
 	return strings.ToUpper(q[:identRunLen(q)])
 }
 
-func secondToken(q string) string {
-	q = stripLeading(q)
-	rest := stripLeading(q[identRunLen(q):])
-	return strings.ToUpper(rest[:identRunLen(rest)])
-}
-
 // skipKeyword advances past kw if it is the leading token of q (after
 // stripping), reporting whether it matched. Used to step over INTO/FROM/TABLE
 // when locating a write target.
 func skipKeyword(q, kw string) (string, bool) {
 	q = stripLeading(q)
 	n := identRunLen(q)
-	if strings.ToUpper(q[:n]) != kw {
+	if !tokenIs(q[:n], kw) {
 		return q, false
 	}
 	return q[n:], true
@@ -201,8 +279,21 @@ func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
-var writeTokens = map[string]struct{}{
-	"INSERT": {}, "UPDATE": {}, "DELETE": {}, "MERGE": {}, "TRUNCATE": {}, "REPLACE": {},
+// isWriteToken reports whether tok is one of the standalone write keywords
+// scanned for inside WITH-prefixed statements, without allocating.
+func isWriteToken(tok string) bool {
+	switch len(tok) {
+	case 5:
+		return tokenIs(tok, "MERGE")
+	case 6:
+		return tokenIs(tok, "INSERT") || tokenIs(tok, "UPDATE") || tokenIs(tok, "DELETE")
+	case 7:
+		return tokenIs(tok, "REPLACE")
+	case 8:
+		return tokenIs(tok, "TRUNCATE")
+	default:
+		return false
+	}
 }
 
 // containsWriteToken reports whether the query contains a standalone write
@@ -217,7 +308,7 @@ func containsWriteToken(q string) bool {
 			continue
 		}
 		if start >= 0 {
-			if _, ok := writeTokens[strings.ToUpper(q[start:i])]; ok {
+			if isWriteToken(q[start:i]) {
 				return true
 			}
 			start = -1

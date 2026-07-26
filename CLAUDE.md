@@ -71,7 +71,10 @@ see DESIGN.md for the full design log.
   `foreign`), because an external effect embedded in a statement is not
   rollback-safe even inside its own tx. Non-SQL clients have no Go hook →
   `Check`/`Do` adapters remain their extension point (Op is already
-  free-form). Matchers run on the hot path — keep them cheap.
+  free-form). Matchers run on the hot path — keep them cheap. Classifier and
+  StatementChecker must be pure functions of the query: the prepared-statement
+  path evaluates both once at prepare time and reuses the results per
+  execution (`wrappedStmt.kind` / `wrappedStmt.stmtOps`).
 - **No panicking reporter**: test-failure ergonomics are `Require*`
   assertions + stack traces in violations (`stack.go`, default depth 32,
   `WithStackDepth(0)` disables). Stack capture skips leading txnpure-internal
@@ -95,7 +98,7 @@ touching `driver.go`:
 - `wrappedConn.txID`/`txScope` need no locking (database/sql guarantees
   single goroutine per driver.Conn); the scope's `openTxs` counter is the
   shared/atomic one.
-- **Closing is idempotent per conn** (`txID == 0` guard): a textual `COMMIT`
+- **Closing is idempotent per conn** (`inTx` guard): a textual `COMMIT`
   inside a driver-level tx, double closes, etc. decrement the scope counter
   at most once. `Commit`/`Rollback` errors still close — a counter stuck
   high poisons every later checkpoint in the scope (a permanent false
@@ -163,6 +166,25 @@ cross-connection, RoundTripper-in-tx, and unscoped-tx. Tests skip unless
 `TXNPURE_E2E_PG_DSN` is set; `e2e/run.sh` initdbs a socket-only cluster (no
 Docker) and exports it. DDL setup runs with no scope so it never trips a
 checkpoint. CI uses one PostgreSQL major (no version-specific behavior).
+
+## Performance guardrails
+
+The always-on hot paths (classifier, driver observe, checkpoint fast path)
+must stay allocation-free; StartScope has a fixed 3-alloc budget. Two gates
+enforce this — when a change trips one, fix the regression rather than
+loosening the gate (loosen only with justification in the PR):
+
+- `TestHotPathAllocations` pins exact allocs/op via `testing.AllocsPerRun`.
+  It self-skips under `-race` (the race runtime allocates), so CI runs it in
+  a separate no-race step; `make test` runs both.
+- The `benchmark` CI job (PRs only) benches head and base back to back on
+  one runner and compares with `internal/benchgate` (root-module package,
+  stdlib only): any allocs/op or B/op increase fails; median ns/op beyond
+  +25% past a 5ns absolute floor fails. Head-only benchmarks are
+  informational, so adding benchmarks bootstraps cleanly.
+- `bench_test.go` is the suite (`make bench`); cover any new hot path there,
+  and mind `Classifier`/`StatementChecker` purity — prepared statements
+  evaluate both once at prepare time.
 
 ## Roadmap state
 

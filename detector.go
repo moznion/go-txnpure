@@ -22,8 +22,6 @@ type Detector struct {
 	reportNested        bool
 	reportLeaked        bool
 	stackDepth          int
-
-	txSeq atomic.Uint64
 }
 
 // Option configures a Detector.
@@ -111,8 +109,6 @@ func New(opts ...Option) *Detector {
 	}
 	return d
 }
-
-func (d *Detector) nextTxID() uint64 { return d.txSeq.Add(1) }
 
 type scopeCtxKey struct{}
 
