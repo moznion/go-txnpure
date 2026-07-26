@@ -98,7 +98,7 @@ touching `driver.go`:
 - `wrappedConn.txID`/`txScope` need no locking (database/sql guarantees
   single goroutine per driver.Conn); the scope's `openTxs` counter is the
   shared/atomic one.
-- **Closing is idempotent per conn** (`txID == 0` guard): a textual `COMMIT`
+- **Closing is idempotent per conn** (`inTx` guard): a textual `COMMIT`
   inside a driver-level tx, double closes, etc. decrement the scope counter
   at most once. `Commit`/`Rollback` errors still close — a counter stuck
   high poisons every later checkpoint in the scope (a permanent false

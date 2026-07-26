@@ -53,12 +53,12 @@ func (w *wrappedConnector) Driver() driver.Driver {
 // wrappedConn tracks the transaction lifecycle of one connection and
 // attributes each transaction to the scope carried by the ctx it was begun
 // with. database/sql guarantees a driver.Conn is used by a single goroutine
-// at a time, so txID/txScope need no locking; the scope counter is the
+// at a time, so inTx/txScope need no locking; the scope counter is the
 // shared/atomic one.
 type wrappedConn struct {
 	det     *Detector
 	conn    driver.Conn
-	txID    uint64 // non-zero while inside a transaction
+	inTx    bool   // whether a transaction is open on this connection
 	txScope *scope // scope the open transaction is attributed to (nil = unscoped)
 
 	// wtx is reused for the connection's driver-level transaction: a
@@ -83,7 +83,7 @@ var (
 // scope (incrementing its open-transaction counter), or reports an unscoped
 // transaction when the ctx carries no scope.
 func (c *wrappedConn) openTx(ctx context.Context) {
-	c.txID = c.det.nextTxID()
+	c.inTx = true
 	c.txScope = scopeFrom(ctx)
 	if c.txScope != nil {
 		c.txScope.openTxs.Add(1)
@@ -93,13 +93,13 @@ func (c *wrappedConn) openTx(ctx context.Context) {
 }
 
 // closeTx ends the connection's transaction, decrementing the scope counter
-// at most once (txID == 0 guard): a textual COMMIT inside a driver-level tx,
+// at most once (inTx guard): a textual COMMIT inside a driver-level tx,
 // double closes, etc. must not drive the counter negative.
 func (c *wrappedConn) closeTx() {
-	if c.txID == 0 {
+	if !c.inTx {
 		return
 	}
-	c.txID = 0
+	c.inTx = false
 	if c.txScope != nil {
 		c.txScope.openTxs.Add(-1)
 		c.txScope = nil
@@ -127,7 +127,7 @@ func (c *wrappedConn) observe(ctx context.Context, query string) {
 func (c *wrappedConn) observeKind(ctx context.Context, query string, kind StatementKind) {
 	switch kind {
 	case KindBegin:
-		if c.txID == 0 {
+		if !c.inTx {
 			c.openTx(ctx)
 		}
 	case KindCommit, KindRollback:
@@ -150,7 +150,7 @@ func (c *wrappedConn) reportIfCrossConn(ctx context.Context, query string) {
 		return
 	}
 	var self int64
-	if c.txID != 0 && c.txScope == s {
+	if c.inTx && c.txScope == s {
 		self = 1
 	}
 	foreign := s.openTxs.Load() - self
