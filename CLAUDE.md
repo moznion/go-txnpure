@@ -170,21 +170,24 @@ checkpoint. CI uses one PostgreSQL major (no version-specific behavior).
 ## Performance guardrails
 
 The always-on hot paths (classifier, driver observe, checkpoint fast path)
-must stay allocation-free; StartScope has a fixed 3-alloc budget. Two gates
-enforce this — when a change trips one, fix the regression rather than
-loosening the gate (loosen only with justification in the PR):
+must stay allocation-free; StartScope has a fixed 3-alloc budget. **Only the
+deterministic gate runs in CI** — when a change trips it, fix the regression
+rather than loosening the gate (loosen only with justification in the PR):
 
 - `TestHotPathAllocations` pins exact allocs/op via `testing.AllocsPerRun`.
   It self-skips under `-race` (the race runtime allocates), so CI runs it in
   a separate no-race step; `make test` runs both.
-- The `benchmark` CI job (PRs only) benches head and base back to back on
-  one runner and compares with `internal/benchgate` (root-module package,
-  stdlib only): any allocs/op or B/op increase fails; median ns/op beyond
-  +25% past a 5ns absolute floor fails. Head-only benchmarks are
-  informational, so adding benchmarks bootstraps cleanly.
-- `bench_test.go` is the suite (`make bench`); cover any new hot path there,
-  and mind `Classifier`/`StatementChecker` purity — prepared statements
-  evaluate both once at prepare time.
+- **Timing is deliberately not gated in CI.** A `benchmark` job that benched
+  head and base back to back existed and was removed: the suite takes >5 min
+  per side, so it doubled PR latency for a ns/op signal that is noisy on
+  shared runners anyway. Do not reintroduce it; extend
+  `TestHotPathAllocations` instead when a new path needs a guardrail.
+- `bench_test.go` is the suite (`make bench`), a local tool; cover any new hot
+  path there, and mind `Classifier`/`StatementChecker` purity — prepared
+  statements evaluate both once at prepare time. `internal/benchgate`
+  (root-module package, stdlib only) compares two local runs: any allocs/op or
+  B/op increase fails; median ns/op beyond +25% past a 5ns absolute floor
+  fails; head-only benchmarks are informational.
 
 ## Roadmap state
 

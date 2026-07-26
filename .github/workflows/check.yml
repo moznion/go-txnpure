@@ -33,35 +33,6 @@ jobs:
         # so run it again without -race to make it actually gate.
         run: go test -count=1 -run TestHotPathAllocations .
 
-  benchmark:
-    # Performance-regression gate: run the benchmark suite on the PR head and
-    # on its base in the same job (same runner), then compare with
-    # internal/benchgate — any allocs/op or B/op increase fails, and a median
-    # ns/op regression beyond +25% (and beyond a 5ns absolute floor) fails.
-    # Base and head run back to back on one runner, so the time comparison is
-    # meaningful; absolute numbers across jobs are not.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-      - name: Build benchgate from head
-        run: go build -o /tmp/benchgate ./internal/benchgate
-      - name: Benchmark head
-        run: go test -run '^$' -bench . -benchmem -count=8 -timeout 30m . | tee /tmp/head.txt
-      - name: Benchmark base
-        # The base may predate some benchmarks (or all of them); benchgate
-        # treats head-only benchmarks as informational, so this bootstraps.
-        run: |
-          git checkout --detach ${{ github.event.pull_request.base.sha }}
-          go test -run '^$' -bench . -benchmem -count=8 -timeout 30m . | tee /tmp/base.txt
-      - name: Compare against base
-        run: /tmp/benchgate /tmp/base.txt /tmp/head.txt
-
   grpc:
     runs-on: ubuntu-latest
     strategy:
