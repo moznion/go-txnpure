@@ -168,3 +168,14 @@ checkpoint. CI uses one PostgreSQL major (no version-specific behavior).
 
 M0–M3 of DESIGN.md §6 are implemented (core, governance, grpc, examples,
 e2e, doc.go). Remaining: version tags (`v0.1.0` / `v0.2.0`).
+
+## Releasing
+
+Tagging and GitHub Releases are automated by [tagpr](https://github.com/Songmu/tagpr)
+(`.tagpr`, `.github/workflows/tagpr.yml`). A push to `main` opens/updates a
+release PR; merging it tags `vX.Y.Z` and cuts the release. `version.go`'s
+`Version` constant is tagpr's version file — never edit it by hand. The
+workflow needs a `TAGPR_TOKEN` secret (PAT or GitHub App token); with the
+default `GITHUB_TOKEN` the release PR would not trigger the `check` workflow.
+Child modules (`grpc/`, `e2e/`, `examples/*`) are not versioned by tagpr —
+tag those manually if they ever need releasing.
