@@ -60,6 +60,11 @@ type wrappedConn struct {
 	conn    driver.Conn
 	txID    uint64 // non-zero while inside a transaction
 	txScope *scope // scope the open transaction is attributed to (nil = unscoped)
+
+	// wtx is reused for the connection's driver-level transaction: a
+	// driver.Conn hosts at most one at a time and is used by a single
+	// goroutine, so handing out &wtx saves an allocation per transaction.
+	wtx wrappedTx
 }
 
 var (
@@ -178,7 +183,8 @@ func (c *wrappedConn) Begin() (driver.Tx, error) {
 		return nil, err
 	}
 	c.beginDriverTx(context.Background())
-	return &wrappedTx{conn: c, tx: tx}, nil
+	c.wtx = wrappedTx{conn: c, tx: tx}
+	return &c.wtx, nil
 }
 
 func (c *wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
@@ -196,7 +202,8 @@ func (c *wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		return nil, err
 	}
 	c.beginDriverTx(ctx)
-	return &wrappedTx{conn: c, tx: tx}, nil
+	c.wtx = wrappedTx{conn: c, tx: tx}
+	return &c.wtx, nil
 }
 
 // beginDriverTx opens the driver-level transaction. If a textual BEGIN
