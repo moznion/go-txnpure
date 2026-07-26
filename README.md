@@ -340,17 +340,23 @@ Design notes that keep the hot path cheap — and what they ask of you:
   the checkpoint. Ordinary middleware stacks are fine; just avoid putting the
   scope hundreds of layers away from the side-effect call sites.
 
-Two CI gates protect against regressions:
+Regressions are gated deterministically:
 
 - `TestHotPathAllocations` pins the exact allocation budget of every path
   above with `testing.AllocsPerRun` — deterministic, so any new allocation
   fails CI outright (it skips under `-race`; CI runs it in a separate
   no-race step).
-- The `benchmark` CI job runs the benchmark suite on a PR's head and base
-  back to back on the same runner and compares them with
-  `internal/benchgate`: any `allocs/op` or `B/op` increase fails, and a
-  median `ns/op` regression beyond +25% (past a 5 ns absolute floor,
-  which keeps nanosecond-scale benchmarks from flaking) fails.
+- Timing is *not* gated in CI. Benchmarking a PR's head and base on a shared
+  runner costs more than ten minutes per PR for a noisy signal, so the suite
+  is a local tool instead: `make bench`, and `internal/benchgate` compares two
+  runs (any `allocs/op` or `B/op` increase fails it, as does a median `ns/op`
+  regression beyond +25% past a 5 ns absolute floor).
+
+```console
+go test -run '^$' -bench . -benchmem -count=8 . | tee /tmp/base.txt  # on main
+go test -run '^$' -bench . -benchmem -count=8 . | tee /tmp/head.txt  # on your branch
+go run ./internal/benchgate /tmp/base.txt /tmp/head.txt
+```
 
 ## Blind spots (accepted, documented)
 
@@ -379,7 +385,7 @@ modules; the children `replace` the root to keep it zero-dependency. Dev tools
 make fmt    # gofmt -s + goimports
 make lint   # golangci-lint
 make test   # go test -race, plus the no-race allocation-budget test
-make bench  # the benchmark suite (compare runs with internal/benchgate)
+make bench  # the benchmark suite, local only (compare runs with internal/benchgate)
 ```
 
 Before committing, `gofmt -l .` must be empty, `golangci-lint run` clean, and
