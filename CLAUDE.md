@@ -79,11 +79,35 @@ see DESIGN.md for the full design log.
   assertions + stack traces in violations (`stack.go`, default depth 32,
   `WithStackDepth(0)` disables). Stack capture skips leading txnpure-internal
   frames but never `_test.go` frames.
-- **Allow precedence**: `AllowInTransaction` (call site) → `Allowlist`
-  (central) → `Baseline` (wrapper reporter, filters last by construction).
-  All three carry rot prevention: `StaleAllowReporter` fires when an allowed
-  check runs outside any transaction; `UnusedEntries()` on Allowlist and
-  Baseline is meant to fail CI when stale.
+- **Allow precedence**: `AllowInTransaction` (call site) →
+  `AllowInTransactionHere` (ctx region, §4.14) → `Allowlist` (central) →
+  `Baseline` (wrapper reporter, filters last by construction). All carry rot
+  prevention: `StaleAllowReporter` fires when an allowed check runs outside
+  any transaction; `UnusedEntries()` on Allowlist and Baseline is meant to
+  fail CI when stale.
+- **`AllowInTransactionHere(ctx, reason, exactCalls...)`** (§4.14) is a
+  **lexical region**, not a scope/tx mark: it derives a ctx and covers
+  exactly the events observed under it, every op kind — the only in-code
+  hatch for the detection points with no call site (cross-conn writes,
+  statement-checker matches, RoundTripper). It piggybacks on `scopeCtxKey`
+  (`*scope` | `*allowedScope`, resolved by `scopeAndMarkFrom` in ONE
+  ctx.Value walk — never add a second key). No scope → no-op; inner mark
+  shadows outer; a nested `StartScope` does not inherit it. Do NOT turn it
+  into a scope-wide mark: that would suppress every op in the scope and
+  break `(Scope, Op)` identity (deliberate divergence from txnproof #14,
+  DESIGN.md log #6).
+- **Exact call counts** (§4.13, txnproof #12 analog): every allow form takes
+  variadic `exactCalls` pinning the number of in-transaction calls covered
+  per scope execution — NOT nesting depth (rejected; log #5). Option/
+  Allowlist counts pin the per-identity total (`scope.calls`, lazy map,
+  hazard path only — `Violation.Call` is the 1-based index);  a Here region
+  pins its own event total (`allowMark.n`). Immediate-verdict split: calls
+  ≤ max(declared) are suppressed as they arrive, the excess call violates
+  immediately (`Violation.AllowedCalls` carries the declining declaration),
+  and exactness is verified at `finishScope` — mismatch → `StaleAllow` with
+  `Calls`/`AllowedCalls`, never a retroactive Violation. Shared rule:
+  `coversCalls`; keep all three mechanisms deciding identically
+  (`TestAllowFormsDecideIdentically` pins it).
 
 ## Driver-wrapper correctness notes
 
@@ -209,7 +233,8 @@ CI job runs a short generative pass per PR. Seed corpora replay in the normal
   what the direct path reports), `FuzzLoadBaseline` (hand-edited file: error,
   never panic; stable Save/Load round trip), `FuzzViolationPipeline` (arbitrary
   identity strings through allowlist → baseline → throttling → rendering, with
-  the suppression contract intact), plus
+  the suppression contract — including exact-call counts and
+  AllowInTransactionHere regions, modeled independently — intact), plus
   `FuzzDefaultClassifierMatchesReference` in `classify_internal_test.go`
   (differential against `referenceClassifier`, its readable specification).
 - **A failing input is committed**, not just fixed: `go test -fuzz` writes it
@@ -223,8 +248,9 @@ CI job runs a short generative pass per PR. Seed corpora replay in the normal
 
 ## Roadmap state
 
-M0–M3 of DESIGN.md §6 are implemented (core, governance, grpc, examples,
-e2e, doc.go). Remaining: version tags (`v0.1.0` / `v0.2.0`).
+M0–M4 of DESIGN.md §6 are implemented (core, governance, grpc, examples,
+e2e, doc.go, allow hatches §4.13–4.14). Remaining: version tags
+(`v0.1.0` / `v0.2.0`).
 
 ## Releasing
 

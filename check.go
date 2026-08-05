@@ -23,6 +23,7 @@ type CheckOption func(*checkConfig)
 type checkConfig struct {
 	allowed     bool
 	allowReason string
+	allowCounts []int
 	attrs       []ScopeAttr
 }
 
@@ -31,14 +32,27 @@ type checkConfig struct {
 // in-code alternative to a central Allowlist entry. The reason should say why
 // and reference a ticket.
 //
+// Optional exactCalls pin the exact number of in-transaction calls of this
+// (scope, op) identity the allow covers per scope execution, so a reviewed
+// exemption cannot silently grow when the code starts calling more often (a
+// loop, a retry, a second call site sharing the op): calls beyond the
+// largest declared count are reported as Violations carrying AllowedCalls,
+// and a scope that finishes with a total not among the declared counts
+// reports a StaleAllow. Several counts may be listed for a path whose
+// legitimate call count varies. Counts below 1 can never cover a call and
+// are permanently stale. Omitting them keeps the unconditional behavior: any
+// number of in-transaction calls is suppressed.
+//
 // Rot prevention works per execution instead of per entry: when the allowed
 // check runs outside any transaction (the allow suppressed nothing),
 // reporters that implement StaleAllowReporter are notified — exact in
 // deterministic tests, a hint in production.
-func AllowInTransaction(reason string) CheckOption {
+func AllowInTransaction(reason string, exactCalls ...int) CheckOption {
+	counts := append([]int(nil), exactCalls...)
 	return func(c *checkConfig) {
 		c.allowed = true
 		c.allowReason = reason
+		c.allowCounts = counts
 	}
 }
 
@@ -68,7 +82,7 @@ func (d *Detector) Do(ctx context.Context, op Op, f func(context.Context) error,
 }
 
 func (d *Detector) check(ctx context.Context, op Op, opts []CheckOption) {
-	s := scopeFrom(ctx)
+	s, mark := scopeAndMarkFrom(ctx)
 	if s == nil {
 		if d.reportUnscopedCheck {
 			u := UnscopedCheck{Op: op, Stack: captureStack(d.stackDepth), Time: time.Now()}
@@ -86,22 +100,57 @@ func (d *Detector) check(ctx context.Context, op Op, opts []CheckOption) {
 	}
 	open := int(s.openTxs.Load())
 	if open <= 0 {
+		// Every in-code allow present here suppressed nothing (§4.13/4.14
+		// uniform rule): report each as stale, per execution.
 		if cfg.allowed {
-			sa := StaleAllow{Scope: s.name, Op: op, Reason: cfg.allowReason}
-			for _, r := range d.reporters {
-				if sr, ok := r.(StaleAllowReporter); ok {
-					sr.ReportStaleAllow(ctx, sa)
-				}
-			}
+			d.reportStaleAllow(ctx, StaleAllow{Scope: s.name, Op: op, Reason: cfg.allowReason})
+		}
+		if mark != nil {
+			d.reportStaleAllow(ctx, StaleAllow{Scope: s.name, Op: op, Reason: mark.reason})
 		}
 		return
 	}
-	// Precedence: AllowInTransaction → Allowlist → baseline (a wrapper
-	// reporter, so it filters last by construction).
+	d.decideAndReport(ctx, s, mark, op, open, cfg)
+}
+
+// decideAndReport resolves the allow tiers for one in-transaction detection
+// event — AllowInTransaction (call site) → AllowInTransactionHere (ctx
+// region) → Allowlist — and reports a Violation when none covers it; the
+// Baseline filters last, as a wrapper reporter. Exact-call declarations that
+// decline (§4.13) fall through to the next tier and are carried on the
+// Violation as AllowedCalls when nothing covers the call.
+func (d *Detector) decideAndReport(ctx context.Context, s *scope, mark *allowMark, op Op, open int, cfg checkConfig) {
+	key := ViolationKey{Scope: s.name, Kind: op.Kind, Name: op.Name}
+	k := s.bumpCall(key)
+	var declined []int
 	if cfg.allowed {
-		return
+		s.noteDeclared(key, cfg.allowCounts, cfg.allowReason)
+		if coversCalls(cfg.allowCounts, k) {
+			return
+		}
+		declined = append(declined, cfg.allowCounts...)
 	}
-	d.emitViolation(ctx, s, op, open, cfg.attrs)
+	if mark != nil {
+		// The region pins its own event total, not the per-identity one: a
+		// counted AllowInTransactionHere declares how many in-transaction
+		// side effects the region performs, whatever their ops.
+		mk := int(mark.n.Add(1))
+		if coversCalls(mark.counts, mk) {
+			return
+		}
+		declined = append(declined, mark.counts...)
+	}
+	if d.allowlist != nil {
+		covered, counts, reason, present := d.allowlist.decide(s.name, op, k)
+		if present {
+			s.noteDeclared(key, counts, reason)
+			if covered {
+				return
+			}
+			declined = append(declined, counts...)
+		}
+	}
+	d.emitViolation(ctx, s, op, open, k, declined, cfg.attrs)
 }
 
 // appliedCheckConfig folds opts into a config. Kept out of check so that the
@@ -118,34 +167,35 @@ func appliedCheckConfig(opts []CheckOption) checkConfig {
 // checkNeeded reports whether an option-less checkpoint on ctx could produce
 // any report, so adapters (WrapRoundTripper) can skip deriving the Op name on
 // the per-request fast path. It mirrors check(): with no scope only
-// unscoped-check detection would report, and a scope with no open transaction
-// reports nothing when no AllowInTransaction is in play (StaleAllow needs it)
-// — so it must not gate checkpoints that pass options.
+// unscoped-check detection would report; a scope with no open transaction
+// reports nothing unless an in-code allow is in play (StaleAllow needs it) —
+// an AllowInTransactionHere mark on the ctx, or options, which this must not
+// gate.
 func (d *Detector) checkNeeded(ctx context.Context) bool {
-	if s := scopeFrom(ctx); s != nil {
-		return s.openTxs.Load() > 0
+	if s, mark := scopeAndMarkFrom(ctx); s != nil {
+		return s.openTxs.Load() > 0 || mark != nil
 	}
 	return d.reportUnscopedCheck
 }
 
-// emitViolation assembles a Violation (allowlist filter, attrs merge, stack
-// capture) and hands it to every reporter. Shared by the checkpoint path
-// (Check/Do/RoundTripper) and the cross-connection-write path; the Allowlist
-// is consulted here, and the Baseline filters later as a wrapper reporter.
-func (d *Detector) emitViolation(ctx context.Context, s *scope, op Op, open int, checkAttrs []ScopeAttr) {
-	if d.allowlist != nil && d.allowlist.allow(s.name, op) {
-		return
-	}
+// emitViolation assembles a Violation (attrs merge, stack capture) and hands
+// it to every reporter. Shared by the checkpoint path (Check/Do/RoundTripper),
+// the cross-connection-write path and the statement-checker path — always via
+// decideAndReport, which resolves the allow tiers first; the Baseline filters
+// later as a wrapper reporter.
+func (d *Detector) emitViolation(ctx context.Context, s *scope, op Op, open, call int, allowedCalls []int, checkAttrs []ScopeAttr) {
 	attrs := make([]ScopeAttr, 0, len(s.attrs)+len(checkAttrs))
 	attrs = append(attrs, s.attrs...)
 	attrs = append(attrs, checkAttrs...)
 	v := Violation{
-		Op:      op,
-		Scope:   s.name,
-		OpenTxs: open,
-		Stack:   captureStack(d.stackDepth),
-		Attrs:   attrs,
-		Time:    time.Now(),
+		Op:           op,
+		Scope:        s.name,
+		OpenTxs:      open,
+		Call:         call,
+		AllowedCalls: allowedCalls,
+		Stack:        captureStack(d.stackDepth),
+		Attrs:        attrs,
+		Time:         time.Now(),
 	}
 	for _, r := range d.reporters {
 		r.Report(ctx, v)
@@ -174,19 +224,31 @@ type StatementChecker func(query string) (Op, bool)
 
 // runStatementCheckers reports a Violation for each registered checker that
 // recognizes query as an external call, when a transaction is open in the ctx
-// scope. Callers guard with len(d.stmtCheckers) != 0.
+// scope. Callers guard with len(d.stmtCheckers) != 0. With no transaction
+// open the checkers normally do not even run; an AllowInTransactionHere mark
+// on the ctx is the exception — a marked match running outside any
+// transaction is a stale allow (§4.14), and the extra work is gated on the
+// mark being present.
 func (d *Detector) runStatementCheckers(ctx context.Context, query string) {
-	s := scopeFrom(ctx)
+	s, mark := scopeAndMarkFrom(ctx)
 	if s == nil {
 		return
 	}
 	open := int(s.openTxs.Load())
 	if open <= 0 {
+		if mark == nil {
+			return
+		}
+		for _, chk := range d.stmtCheckers {
+			if op, ok := chk(query); ok {
+				d.reportStaleAllow(ctx, StaleAllow{Scope: s.name, Op: op, Reason: mark.reason})
+			}
+		}
 		return
 	}
 	for _, chk := range d.stmtCheckers {
 		if op, ok := chk(query); ok {
-			d.emitViolation(ctx, s, op, open, nil)
+			d.decideAndReport(ctx, s, mark, op, open, checkConfig{})
 		}
 	}
 }
@@ -196,15 +258,21 @@ func (d *Detector) runStatementCheckers(ctx context.Context, query string) {
 // functions of the query), so each execution only consults the scope counter
 // and reports the pre-matched ops. Callers guard with len(ops) != 0.
 func (d *Detector) reportStatementOps(ctx context.Context, ops []Op) {
-	s := scopeFrom(ctx)
+	s, mark := scopeAndMarkFrom(ctx)
 	if s == nil {
 		return
 	}
 	open := int(s.openTxs.Load())
 	if open <= 0 {
+		if mark == nil {
+			return
+		}
+		for _, op := range ops {
+			d.reportStaleAllow(ctx, StaleAllow{Scope: s.name, Op: op, Reason: mark.reason})
+		}
 		return
 	}
 	for _, op := range ops {
-		d.emitViolation(ctx, s, op, open, nil)
+		d.decideAndReport(ctx, s, mark, op, open, checkConfig{})
 	}
 }

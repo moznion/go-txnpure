@@ -103,6 +103,8 @@ func FuzzDriverSequence(f *testing.F) {
 		{[]byte{0x20, 0x20, 0x40, 0x40, 0x60}, "ROLLBACK"},           // repeated begin/commit
 		{[]byte{0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa}, "\x00\xff"},     // non-UTF-8 query
 		{[]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, ""}, // every action once
+		{[]byte{0x03, 0xd8, 0x16, 0x04}, "INSERT INTO t VALUES (1)"}, // marked cross-conn write + marked check
+		{[]byte{0x13, 0x10, 0x12, 0x14}, "notify_external('x')"},     // begin/exec/prepare under the allow mark
 	}
 	for _, s := range seeds {
 		f.Add(s.ops, s.query)
@@ -169,7 +171,9 @@ func adversarialClassifier(seed byte) Classifier {
 // transaction it may have opened and returns the final counter.
 //
 // Each byte encodes one operation: bits 0-2 select the action, bit 3 the
-// connection, bits 5-7 the statement.
+// connection, bit 4 whether the action runs under a counted
+// AllowInTransactionHere region (allows suppress reports, never touch the
+// counter — the invariant must hold identically), and bits 5-7 the statement.
 func runFuzzDriverOps(t *testing.T, det *Detector, ops []byte, query string) int64 {
 	t.Helper()
 
@@ -192,6 +196,10 @@ func runFuzzDriverOps(t *testing.T, det *Detector, ops []byte, query string) int
 	ctx, finish := det.StartScope(context.Background(), "FuzzScope")
 	defer finish()
 	s := scopeFrom(ctx)
+	// A counted allow region shared by every bit-4 op: exercises suppression,
+	// the region counter and the finish-time shortfall reporting alongside
+	// the transaction stream.
+	actx := AllowInTransactionHere(ctx, "fuzz allow", 1)
 
 	var conns [fuzzConns]*sql.Conn
 	for i := range conns {
@@ -211,21 +219,25 @@ func runFuzzDriverOps(t *testing.T, det *Detector, ops []byte, query string) int
 	for _, op := range ops {
 		i := int(op>>3) % fuzzConns
 		c, q := conns[i], stmts[op>>5]
+		ectx := ctx
+		if op&0x10 != 0 {
+			ectx = actx
+		}
 		switch op & 0x7 {
 		case 0:
-			_, _ = c.ExecContext(ctx, q)
+			_, _ = c.ExecContext(ectx, q)
 		case 1:
-			if rows, err := c.QueryContext(ctx, q); err == nil {
+			if rows, err := c.QueryContext(ectx, q); err == nil {
 				_ = rows.Close()
 			}
 		case 2:
-			if st, err := c.PrepareContext(ctx, q); err == nil {
-				_, _ = st.ExecContext(ctx)
+			if st, err := c.PrepareContext(ectx, q); err == nil {
+				_, _ = st.ExecContext(ectx)
 				_ = st.Close()
 			}
 		case 3:
 			if txs[i] == nil {
-				if tx, err := c.BeginTx(ctx, nil); err == nil {
+				if tx, err := c.BeginTx(ectx, nil); err == nil {
 					txs[i] = tx
 				}
 			}
@@ -240,7 +252,7 @@ func runFuzzDriverOps(t *testing.T, det *Detector, ops []byte, query string) int
 				txs[i] = nil
 			}
 		case 6:
-			det.Check(ctx, Op{Kind: "http", Name: "GET api.example.com"})
+			det.Check(ectx, Op{Kind: "http", Name: "GET api.example.com"})
 		case 7:
 			// The same statement with no scope on its context: pooled
 			// connections must not leak transaction state across scopes.
@@ -430,20 +442,32 @@ func FuzzLoadBaseline(f *testing.F) {
 
 // FuzzViolationPipeline pushes arbitrary scope and op strings — non-UTF-8,
 // embedded NULs, empty, the AnyScope wildcard — through the full reporting
-// pipeline (allowlist → baseline → throttling → rendering). Identities come
-// from user code, so no string may crash a reporter, and the suppression
-// contract must hold whatever the strings look like.
+// pipeline (allow tiers → allowlist → baseline → throttling → rendering),
+// with fuzzed exact-call declarations (§4.13) and an optional
+// AllowInTransactionHere region (§4.14). Identities come from user code, so
+// no string may crash a reporter, and the suppression contract — including
+// the shared coversCalls rule and the finish-time shortfall — must hold
+// whatever the inputs look like.
 func FuzzViolationPipeline(f *testing.F) {
-	f.Add("CreateUser", "http", "GET api.example.com", false, false)
-	f.Add("CreateUser", "http", "GET api.example.com", true, false)
-	f.Add("CreateUser", "db", "users", false, true)
-	f.Add("*", "", "", true, true)
-	f.Add("", "\x00", "\x00", false, false)
-	f.Add("s\x00k", "", "n", false, false)
-	f.Add("\xff", "\xff", "\xff", false, false)
+	f.Add("CreateUser", "http", "GET api.example.com", false, false, false, byte(0), byte(0))
+	f.Add("CreateUser", "http", "GET api.example.com", true, false, false, byte(0), byte(0))
+	f.Add("CreateUser", "db", "users", false, true, false, byte(0), byte(1))
+	f.Add("CreateUser", "http", "GET api.example.com", true, false, false, byte(1), byte(2)) // counted entry, excess
+	f.Add("CreateUser", "http", "GET api.example.com", false, false, true, byte(3), byte(0)) // counted region, shortfall
+	f.Add("CreateUser", "http", "GET api.example.com", true, true, true, byte(2), byte(1))
+	f.Add("*", "", "", true, true, false, byte(0), byte(0))
+	f.Add("", "\x00", "\x00", false, false, false, byte(0), byte(2))
+	f.Add("s\x00k", "", "n", false, false, true, byte(0), byte(0))
+	f.Add("\xff", "\xff", "\xff", false, false, false, byte(2), byte(2))
 
-	f.Fuzz(func(t *testing.T, scopeName, kind, name string, allowed, baselined bool) {
+	f.Fuzz(func(t *testing.T, scopeName, kind, name string, allowed, baselined, marked bool, declaredRaw, eventsRaw byte) {
 		op := Op{Kind: kind, Name: name}
+		events := 1 + int(eventsRaw%3) // 1..3 in-transaction checkpoints
+		declared := int(declaredRaw % 5)
+		var counts []int
+		if declared != 0 {
+			counts = []int{declared}
+		}
 		collected := NewCollectingReporter()
 
 		var next Reporter = collected
@@ -452,7 +476,7 @@ func FuzzViolationPipeline(f *testing.F) {
 		}
 		allowlist := NewAllowlist()
 		if allowed {
-			allowlist.Add(scopeName, op, "fuzz")
+			allowlist.Add(scopeName, op, "fuzz", counts...)
 		}
 		det := New(
 			WithReporter(NewThrottlingReporter(next, time.Minute)),
@@ -462,22 +486,47 @@ func FuzzViolationPipeline(f *testing.F) {
 		)
 
 		ctx, finish := det.StartScope(context.Background(), scopeName, WithScopeAttrs(Attr(name, kind)))
-		defer finish()
 		scopeFrom(ctx).openTxs.Add(1)
-		det.Check(ctx, op)
+		cctx := ctx
+		if marked {
+			cctx = AllowInTransactionHere(ctx, "fuzz", counts...)
+		}
+		for i := 0; i < events; i++ {
+			det.Check(cctx, op)
+		}
+		scopeFrom(ctx).openTxs.Add(-1)
+		finish()
 
-		want := 1
-		if allowed || baselined {
-			want = 0
+		// Independent model of the covers rule: an allow (region or entry —
+		// both compare against the same event sequence here) suppresses
+		// events up to the declared count, or all of them when uncounted.
+		suppressed := 0
+		if allowed || marked {
+			suppressed = events
+			if declared != 0 && declared < events {
+				suppressed = declared
+			}
+		}
+		raw := events - suppressed
+		want := 0
+		if raw > 0 && !baselined {
+			want = 1 // the throttler forwards the first violation, then dedups
 		}
 		vs := collected.Violations()
 		if len(vs) != want {
-			t.Fatalf("got %d violations (scope %q, op %+v, allowed=%v, baselined=%v), want %d",
-				len(vs), scopeName, op, allowed, baselined, want)
+			t.Fatalf("got %d violations (scope %q, op %+v, allowed=%v, baselined=%v, marked=%v, declared=%d, events=%d), want %d",
+				len(vs), scopeName, op, allowed, baselined, marked, declared, events, want)
 		}
 		for _, v := range vs {
 			if v.String() == "" {
 				t.Fatal("Violation.String() is empty")
+			}
+		}
+		// Shortfall model: a declared count above the produced total must
+		// surface as a finish-time StaleAllow (never a Violation).
+		if (allowed || marked) && declared > events {
+			if len(collected.StaleAllows()) == 0 {
+				t.Fatalf("declared %d > events %d but no StaleAllow was reported", declared, events)
 			}
 		}
 	})

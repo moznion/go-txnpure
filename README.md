@@ -127,7 +127,8 @@ detector is enough. It also catches two connections to the *same* database.
 Only **writes** trip it (a read on another connection has nothing to roll
 back); the violation identity is `(scope, {Kind: "db", Name: "<table>"})`, so
 intentional cases are suppressed through the `Allowlist` / `Baseline` keyed on
-the table, exactly like any other operation.
+the table, exactly like any other operation — or right at the write itself
+with `AllowInTransactionHere` (see Governance).
 
 ## Quick start
 
@@ -264,6 +265,22 @@ IDs.
 - **`AllowInTransaction(reason)`** at the call site suppresses the violation
   there. If the allowed check runs outside any transaction, reporters
   implementing `StaleAllowReporter` are notified — remove the stale allow.
+- **`AllowInTransactionHere(ctx, reason)`** declares the exemption **at the
+  side effect itself** — the only in-code form for the detection points with
+  no call site to annotate (a cross-connection write, a statement-checker
+  match, a wrapped HTTP request):
+
+  ```go
+  // The cache row lives in another DB on purpose: a rollback leaves a stale
+  // row that expires by TTL (TICKET-99).
+  actx := txnpure.AllowInTransactionHere(ctx, "cache eviction is best-effort (TICKET-99)")
+  cacheDB.ExecContext(actx, "DELETE FROM order_cache WHERE id = $1", id)
+  ```
+
+  It returns a derived context: the allow covers exactly the calls made with
+  it, whatever their kind, and expires with it — wrap one call, not a block,
+  and keep using the original `ctx` everywhere else. A marked call that runs
+  outside any transaction reports a `StaleAllow`, like the option form.
 - **`Allowlist`** is the central list: entries carry a reason and track
   usage; fail CI when `UnusedEntries()` is non-empty. Entries key on the exact
   `(scope, Op)`; `AnyScope` is a wildcard scope for bulk adoption (discouraged
@@ -273,7 +290,30 @@ IDs.
   with `NewBaselineReporter` — only new violations fail, and
   `UnusedEntries()` tells you when a baselined call site got fixed.
 
-Precedence: `AllowInTransaction` → `Allowlist` → baseline filter.
+Precedence: `AllowInTransaction` → `AllowInTransactionHere` → `Allowlist` →
+baseline filter.
+
+### Pinning the exact call count
+
+Every allow form (except the baseline) takes optional exact counts of the
+in-transaction calls it covers per scope execution, so a reviewed exemption
+cannot silently grow when the code starts calling more often (a loop, a
+retry, a new call site):
+
+```go
+txnpure.AllowInTransaction("one heartbeat per order (TICKET-42)", 1)
+allowlist.Add("POST /orders", op, "one heartbeat per order (TICKET-42)", 1)
+txnpure.AllowInTransactionHere(ctx, "exactly one eviction (TICKET-99)", 1)
+```
+
+Calls beyond the declared count are reported as Violations immediately —
+carrying `AllowedCalls` and the excess call's own stack — and a scope that
+finishes with a total not among the declared counts reports a `StaleAllow`
+(`RequireNoStaleAllows` fails the test), so both growth and shrinkage
+surface. Several counts may be listed (`AllowInTransaction(reason, 1, 3)`)
+for a path whose legitimate call count varies; `AllowInTransaction` /
+`Allowlist` counts pin the per-`(scope, Op)` total, while an
+`AllowInTransactionHere` count pins the region's own total across ops.
 
 ## Production monitoring
 
