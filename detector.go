@@ -2,6 +2,7 @@ package txnpure
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -125,10 +126,18 @@ type scope struct {
 	// begin/commit on the driver side; the verdict is best-effort by design.
 	openTxs  atomic.Int64
 	finished atomic.Bool
+
+	// callMu guards the exact-call accounting below (§4.13 of DESIGN.md).
+	// Both are touched only on the hazard path (an in-transaction detection
+	// event, or creating a counted allow region) and allocated lazily, so
+	// the always-on fast paths stay allocation-free.
+	callMu sync.Mutex
+	calls  map[ViolationKey]*callCount // in-transaction events per identity
+	marks  []*allowMark                // counted allow regions to verify at finish
 }
 
 func scopeFrom(ctx context.Context) *scope {
-	s, _ := ctx.Value(scopeCtxKey{}).(*scope)
+	s, _ := scopeAndMarkFrom(ctx)
 	return s
 }
 
@@ -181,6 +190,7 @@ func (d *Detector) finishScope(ctx context.Context, s *scope) {
 	if !s.finished.CompareAndSwap(false, true) {
 		return
 	}
+	d.reportCallShortfalls(ctx, s)
 	if !d.reportLeaked {
 		return
 	}

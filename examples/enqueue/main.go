@@ -3,6 +3,11 @@
 // checkpoints without a dedicated adapter. Both run inside a transaction here
 // (the bug), so running it prints two txnpure violations and exits.
 //
+// It also shows the opposite case: a cache eviction in a second database that
+// is non-rollback-safe on purpose, exempted at the write itself with
+// AllowInTransactionHere (a cross-connection write has no call site to hang a
+// CheckOption on) and pinned to exactly one call — it prints nothing.
+//
 // The plain functions below stand in for a real job queue (river/asynq/SQS)
 // and a mail client — the generic Check/Do API is how you instrument any
 // client that has no built-in adapter.
@@ -26,6 +31,8 @@ func main() {
 	)
 	db := detector.NewNullDB()
 	defer func() { _ = db.Close() }()
+	cacheDB := detector.NewNullDB()
+	defer func() { _ = cacheDB.Close() }()
 
 	err := detector.InScope(context.Background(), "CreateOrder", func(ctx context.Context) error {
 		tx, err := db.BeginTx(ctx, nil)
@@ -44,6 +51,16 @@ func main() {
 		// BUG: sending mail inside the transaction — a rollback cannot unsend it.
 		if err := detector.Do(ctx, txnpure.Op{Kind: "mail", Name: "order_confirmation"},
 			func(ctx context.Context) error { return sendMail(ctx, "order_confirmation") }); err != nil {
+			return err
+		}
+
+		// DELIBERATE: evicting the cache row in another database while the
+		// order transaction is open. A rollback merely leaves a stale row
+		// that expires by TTL, so this is exempted right here, at the write
+		// a cross-connection violation would point at, pinned to exactly one
+		// call per scope (TICKET-99). This one prints nothing.
+		actx := txnpure.AllowInTransactionHere(ctx, "cache eviction is best-effort, TTL covers rollback (TICKET-99)", 1)
+		if _, err := cacheDB.ExecContext(actx, "DELETE FROM order_cache WHERE order_id = 1"); err != nil {
 			return err
 		}
 

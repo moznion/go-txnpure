@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,14 @@ type Violation struct {
 	Scope string
 	// OpenTxs is the number of transactions open in the scope at check time.
 	OpenTxs int
+	// Call is the 1-based index of this in-transaction call among the
+	// detection events sharing this violation identity within the scope
+	// execution — the quantity exact-call allows pin (§4.13 of DESIGN.md).
+	Call int
+	// AllowedCalls carries the exact in-transaction call counts declared by
+	// allows that matched this identity but declined to cover this call.
+	// Empty when no exact-call allow was in play.
+	AllowedCalls []int
 	// Stack is the stack captured at Check, resolved to function/file/line,
 	// with txnpure-internal frames skipped. Empty when WithStackDepth(0).
 	Stack []StackFrame
@@ -42,8 +51,25 @@ func (v Violation) key() ViolationKey {
 func (v Violation) String() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "txnpure: side effect [%s] %s ran while %d transaction(s) were open in scope %q", v.Op.Kind, v.Op.Name, v.OpenTxs, v.Scope)
+	if len(v.AllowedCalls) > 0 {
+		// The declining declaration may pin a per-identity or a per-region
+		// total (AllowInTransactionHere), so no call index is rendered here;
+		// Call carries the per-identity index for programmatic use.
+		fmt.Fprintf(&sb, "\n  (allowed for exactly %s in-transaction call(s), so this call is not covered)", joinCounts(v.AllowedCalls))
+	}
 	for _, f := range v.Stack {
 		fmt.Fprintf(&sb, "\n  at %s (%s:%d)", f.Function, f.File, f.Line)
+	}
+	return sb.String()
+}
+
+func joinCounts(counts []int) string {
+	var sb strings.Builder
+	for i, c := range counts {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(strconv.Itoa(c))
 	}
 	return sb.String()
 }
@@ -148,18 +174,29 @@ type UnscopedCheckReporter interface {
 	ReportUnscopedCheck(ctx context.Context, u UnscopedCheck)
 }
 
-// StaleAllow is reported when a check marked with AllowInTransaction runs
-// outside any transaction: the allow suppressed nothing for this execution.
-// Note that this is per execution — a call site reached both inside and
-// outside transactions can legitimately produce both suppressions and
-// StaleAllow reports.
+// StaleAllow is reported when an in-code allow suppressed nothing, in two
+// forms. Per execution: a call covered by AllowInTransaction or an
+// AllowInTransactionHere region ran outside any transaction — a call site
+// reached both inside and outside transactions can legitimately produce both
+// suppressions and StaleAllow reports. At scope finish: an exact-call
+// declaration (on any allow form, including an Allowlist entry) did not
+// match the in-transaction call total the scope actually produced — Calls
+// and AllowedCalls carry the mismatch, and Op is zero when the declaration
+// was an AllowInTransactionHere region (a region covers any op).
 type StaleAllow struct {
 	// Scope is the name of the scope the check ran in.
 	Scope string
-	// Op is the operation the check guarded.
+	// Op is the operation the check guarded. Zero for the exact-call
+	// shortfall of an AllowInTransactionHere region.
 	Op Op
-	// Reason is the reason given to AllowInTransaction.
+	// Reason is the reason given to the allow.
 	Reason string
+	// Calls is the in-transaction call total the scope produced, for the
+	// exact-call shortfall form; 0 for the per-execution form.
+	Calls int
+	// AllowedCalls echoes the declared exact counts, for the exact-call
+	// shortfall form; empty for the per-execution form.
+	AllowedCalls []int
 }
 
 // StaleAllowReporter is an optional extension a Reporter can implement to
@@ -357,13 +394,17 @@ func (r *CollectingReporter) RequireNoLeakedTxs(t TestingT) {
 	}
 }
 
-// RequireNoStaleAllows fails the test with one error per stale
-// AllowInTransaction mark, keeping in-code allows subject to the same rot
-// discipline as Allowlist.UnusedEntries.
+// RequireNoStaleAllows fails the test with one error per stale allow,
+// keeping in-code allows subject to the same rot discipline as
+// Allowlist.UnusedEntries.
 func (r *CollectingReporter) RequireNoStaleAllows(t TestingT) {
 	t.Helper()
 	for _, s := range r.StaleAllows() {
-		t.Errorf("txnpure: check [%s] %s in scope %q is marked AllowInTransaction (%s) but ran outside any transaction; remove the stale allow", s.Op.Kind, s.Op.Name, s.Scope, s.Reason)
+		if len(s.AllowedCalls) > 0 {
+			t.Errorf("txnpure: allow (%s) in scope %q declared exactly %s in-transaction call(s) but %d ran; fix the declared count or remove the allow", s.Reason, s.Scope, joinCounts(s.AllowedCalls), s.Calls)
+			continue
+		}
+		t.Errorf("txnpure: check [%s] %s in scope %q is covered by an in-code allow (%s) but ran outside any transaction; remove the stale allow", s.Op.Kind, s.Op.Name, s.Scope, s.Reason)
 	}
 }
 
@@ -404,6 +445,10 @@ func (r *SlogReporter) Report(ctx context.Context, v Violation) {
 		slog.String("name", v.Op.Name),
 		slog.String("scope", v.Scope),
 		slog.Int("open_txs", v.OpenTxs),
+		slog.Int("call", v.Call),
+	}
+	if len(v.AllowedCalls) > 0 {
+		args = append(args, slog.Any("allowed_calls", v.AllowedCalls))
 	}
 	if len(v.Stack) > 0 {
 		args = append(args, slog.Any("stack", stackStrings(v.Stack)))
@@ -448,7 +493,18 @@ func (r *SlogReporter) ReportLeakedTx(ctx context.Context, l LeakedTx) {
 }
 
 func (r *SlogReporter) ReportStaleAllow(ctx context.Context, s StaleAllow) {
-	r.Logger.WarnContext(ctx, "txnpure: check is marked AllowInTransaction but ran outside any transaction",
+	if len(s.AllowedCalls) > 0 {
+		r.Logger.WarnContext(ctx, "txnpure: allow declared an exact in-transaction call count the scope did not produce",
+			slog.String("scope", s.Scope),
+			slog.String("kind", s.Op.Kind),
+			slog.String("name", s.Op.Name),
+			slog.String("reason", s.Reason),
+			slog.Int("calls", s.Calls),
+			slog.Any("allowed_calls", s.AllowedCalls),
+		)
+		return
+	}
+	r.Logger.WarnContext(ctx, "txnpure: check is covered by an in-code allow but ran outside any transaction",
 		slog.String("scope", s.Scope),
 		slog.String("kind", s.Op.Kind),
 		slog.String("name", s.Op.Name),

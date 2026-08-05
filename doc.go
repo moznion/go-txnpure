@@ -47,9 +47,12 @@
 // One detector serves pure unit tests (via NewNullDB, a no-op driver),
 // tests against a real database (wrap the real driver), and continuous
 // production monitoring (pluggable Reporters; the per-checkpoint overhead is a
-// context lookup and an atomic load). Governance — AllowInTransaction, an
-// Allowlist, and a Baseline ratchet, all keyed on the (Scope, Op) identity —
-// keeps known and intentional cases from failing CI.
+// context lookup and an atomic load). Governance — AllowInTransaction at the
+// checkpoint, AllowInTransactionHere at the side effect itself (the in-code
+// hatch for detection points with no call site, optionally pinned to an
+// exact in-transaction call count), an Allowlist, and a Baseline ratchet,
+// all keyed on the (Scope, Op) identity — keeps known and intentional cases
+// from failing CI.
 //
 // See the package README and DESIGN.md for the full semantics, blind spots,
 // and design rationale.

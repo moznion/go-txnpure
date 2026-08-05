@@ -110,6 +110,32 @@ func TestHotPathAllocations(t *testing.T) {
 		assertAllocs(t, 0, func() { vdet.Check(vctx, op) })
 	})
 
+	t.Run("check_marked_suppressed", func(t *testing.T) {
+		// An AllowInTransactionHere region suppressing an in-transaction
+		// checkpoint stays allocation-free in steady state: the mark rides
+		// the existing scope lookup and the call counter entry is reused.
+		mdet := New(WithReporter(allocFreeReporter{}), WithStackDepth(0))
+		mctx, mfinish := mdet.StartScope(context.Background(), "AllocBudget")
+		defer mfinish()
+		s := scopeFrom(mctx)
+		s.openTxs.Add(1)
+		defer s.openTxs.Add(-1)
+		actx := AllowInTransactionHere(mctx, "alloc budget")
+		op := Op{Kind: "http", Name: "GET api.example.com"}
+		assertAllocs(t, 0, func() { mdet.Check(actx, op) })
+	})
+
+	t.Run("check_marked_no_tx", func(t *testing.T) {
+		// The marked checkpoint with no open transaction (per-event
+		// StaleAllow path, reporter not opting in) is allocation-free too.
+		mdet := New(WithReporter(allocFreeReporter{}), WithStackDepth(0))
+		mctx, mfinish := mdet.StartScope(context.Background(), "AllocBudget")
+		defer mfinish()
+		actx := AllowInTransactionHere(mctx, "alloc budget")
+		op := Op{Kind: "http", Name: "GET api.example.com"}
+		assertAllocs(t, 0, func() { mdet.Check(actx, op) })
+	})
+
 	t.Run("start_scope", func(t *testing.T) {
 		// Fixed by design: the scope holder, the context value, and the
 		// finish closure — one small allocation each, per scope (request).

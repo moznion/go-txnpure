@@ -26,6 +26,7 @@ type Allowlist struct {
 
 type allowlistEntry struct {
 	reason string
+	counts []int // exact in-transaction call counts covered; empty = any
 	used   bool
 }
 
@@ -38,27 +39,45 @@ func NewAllowlist() *Allowlist {
 // transaction. scope may be AnyScope to allow the op in every scope. The
 // reason should say why and reference a ticket. Returns the Allowlist for
 // chaining.
-func (a *Allowlist) Add(scope string, op Op, reason string) *Allowlist {
+//
+// Optional exactCalls pin the exact number of in-transaction calls of the
+// (scope, op) identity the entry covers per scope execution — the same
+// contract as AllowInTransaction: further calls are reported as Violations
+// carrying AllowedCalls, a scope finishing with a total not among the
+// declared counts reports a StaleAllow, and counts below 1 can never cover
+// a call. Omitting them keeps the unconditional behavior.
+func (a *Allowlist) Add(scope string, op Op, reason string, exactCalls ...int) *Allowlist {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.entries[ViolationKey{Scope: scope, Kind: op.Kind, Name: op.Name}] = &allowlistEntry{reason: reason}
+	e := &allowlistEntry{reason: reason}
+	if len(exactCalls) != 0 {
+		e.counts = append([]int(nil), exactCalls...)
+	}
+	a.entries[ViolationKey{Scope: scope, Kind: op.Kind, Name: op.Name}] = e
 	return a
 }
 
-// allow reports whether the (scope, op) pair is allowlisted — exact scope
-// first, then the AnyScope wildcard — marking the matched entry used.
-func (a *Allowlist) allow(scope string, op Op) bool {
+// decide resolves the entry for the (scope, op) pair — exact scope first,
+// then the AnyScope wildcard — against the k-th in-transaction call of that
+// identity. present reports whether an entry matched at all; covered whether
+// it suppresses this call (marking the entry used). counts and reason echo
+// the entry so a declining declaration can be carried on the Violation and
+// verified at scope finish.
+func (a *Allowlist) decide(scope string, op Op, k int) (covered bool, counts []int, reason string, present bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if e, ok := a.entries[ViolationKey{Scope: scope, Kind: op.Kind, Name: op.Name}]; ok {
-		e.used = true
-		return true
+	e, ok := a.entries[ViolationKey{Scope: scope, Kind: op.Kind, Name: op.Name}]
+	if !ok {
+		e, ok = a.entries[ViolationKey{Scope: AnyScope, Kind: op.Kind, Name: op.Name}]
 	}
-	if e, ok := a.entries[ViolationKey{Scope: AnyScope, Kind: op.Kind, Name: op.Name}]; ok {
-		e.used = true
-		return true
+	if !ok {
+		return false, nil, "", false
 	}
-	return false
+	if coversCalls(e.counts, k) {
+		e.used = true
+		return true, e.counts, e.reason, true
+	}
+	return false, e.counts, e.reason, true
 }
 
 // UnusedEntries returns the keys that never suppressed a violation, sorted by

@@ -117,6 +117,34 @@ func BenchmarkCheck(b *testing.B) {
 			det.Check(ctx, op)
 		}
 	})
+	b.Run("marked_suppressed", func(b *testing.B) {
+		// An AllowInTransactionHere region suppressing an in-transaction
+		// checkpoint: the mark lookup rides the scope lookup, plus one
+		// counter bump per event.
+		det := New(WithReporter(benchNoopReporter{}), WithStackDepth(0))
+		ctx, finish := det.StartScope(context.Background(), "bench")
+		defer finish()
+		s := scopeFrom(ctx)
+		s.openTxs.Add(1)
+		defer s.openTxs.Add(-1)
+		actx := AllowInTransactionHere(ctx, "bench")
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			det.Check(actx, op)
+		}
+	})
+	b.Run("marked_scope_no_tx", func(b *testing.B) {
+		// The marked fast path with no open transaction: the per-event
+		// StaleAllow goes to a reporter that does not opt in.
+		det := New(WithReporter(benchNoopReporter{}), WithStackDepth(0))
+		ctx, finish := det.StartScope(context.Background(), "bench")
+		defer finish()
+		actx := AllowInTransactionHere(ctx, "bench")
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			det.Check(actx, op)
+		}
+	})
 }
 
 type benchNoopReporter struct{}

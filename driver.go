@@ -145,23 +145,36 @@ func (c *wrappedConn) observeKind(ctx context.Context, query string, kind Statem
 // it. The connection's own open transaction is excluded (a write inside its
 // own transaction is normal); only *other* connections' transactions count.
 func (c *wrappedConn) reportIfCrossConn(ctx context.Context, query string) {
-	s := scopeFrom(ctx)
+	s, mark := scopeAndMarkFrom(ctx)
 	if s == nil {
 		return
 	}
+	total := s.openTxs.Load()
 	var self int64
 	if c.inTx && c.txScope == s {
 		self = 1
 	}
-	foreign := s.openTxs.Load() - self
+	foreign := total - self
 	if foreign <= 0 {
+		// A marked write with no transaction open at all is a stale allow
+		// (§4.14 uniform rule). A write inside its own connection's
+		// transaction stays silent — that execution is normal, not evidence
+		// the mark is stale.
+		if total == 0 && mark != nil {
+			c.det.reportStaleAllow(ctx, StaleAllow{Scope: s.name, Op: Op{Kind: "db", Name: crossConnOpName(query)}, Reason: mark.reason})
+		}
 		return
 	}
-	name := writeTarget(query)
-	if name == "" {
-		name = "write"
+	c.det.decideAndReport(ctx, s, mark, Op{Kind: "db", Name: crossConnOpName(query)}, int(foreign), checkConfig{})
+}
+
+// crossConnOpName derives the op identity of a write statement: the
+// best-effort table name, or "write" when it cannot tell.
+func crossConnOpName(query string) string {
+	if name := writeTarget(query); name != "" {
+		return name
 	}
-	c.det.emitViolation(ctx, s, Op{Kind: "db", Name: name}, int(foreign), nil)
+	return "write"
 }
 
 func (c *wrappedConn) Prepare(query string) (driver.Stmt, error) {
