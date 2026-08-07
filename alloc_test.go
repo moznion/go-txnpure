@@ -47,10 +47,21 @@ func TestHotPathAllocations(t *testing.T) {
 	})
 
 	t.Run("observe", func(t *testing.T) {
-		conn := &wrappedConn{det: det, conn: nullConn{}}
-		assertAllocs(t, 0, func() { conn.observe(scoped, "select id from users where id = $1") })
-		assertAllocs(t, 0, func() { conn.observe(scoped, "update users set name = $1 where id = $2") })
-		assertAllocs(t, 0, func() { conn.observe(unscoped, "select id from users where id = $1") })
+		// Session is the shared statement-observation path: the driver
+		// middleware delegates here, and native-driver integrations call it
+		// directly — one budget covers both.
+		s := det.NewSession()
+		assertAllocs(t, 0, func() { s.Observe(scoped, "select id from users where id = $1") })
+		assertAllocs(t, 0, func() { s.Observe(scoped, "update users set name = $1 where id = $2") })
+		assertAllocs(t, 0, func() { s.Observe(unscoped, "select id from users where id = $1") })
+		assertAllocs(t, 0, func() {
+			s.Observe(scoped, "begin")
+			s.Observe(scoped, "commit")
+		})
+		assertAllocs(t, 0, func() {
+			s.BeginTx(scoped)
+			s.EndTx()
+		})
 	})
 
 	t.Run("check", func(t *testing.T) {
@@ -71,7 +82,7 @@ func TestHotPathAllocations(t *testing.T) {
 	t.Run("driver_begin_commit", func(t *testing.T) {
 		// The txnpure share of a transaction: the wrapped driver adds no
 		// allocations on top of the underlying driver and database/sql.
-		conn := &wrappedConn{det: det, conn: nullConn{}}
+		conn := &wrappedConn{det: det, conn: nullConn{}, session: Session{det: det}}
 		assertAllocs(t, 0, func() {
 			tx, err := conn.BeginTx(scoped, driver.TxOptions{})
 			if err != nil {
@@ -84,7 +95,7 @@ func TestHotPathAllocations(t *testing.T) {
 	})
 
 	t.Run("prepared_stmt_exec", func(t *testing.T) {
-		conn := &wrappedConn{det: det, conn: nullConn{}}
+		conn := &wrappedConn{det: det, conn: nullConn{}, session: Session{det: det}}
 		stmt, err := conn.PrepareContext(scoped, "with recent as (select 1) select * from recent")
 		if err != nil {
 			t.Fatal(err)

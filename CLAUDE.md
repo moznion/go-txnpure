@@ -114,13 +114,21 @@ see DESIGN.md for the full design log.
 Ported from txnproof; these prevent double counting — keep them intact when
 touching `driver.go`:
 
+- **The tx state machine lives in `Session` (`session.go`), not in
+  `wrappedConn`.** `wrappedConn` holds a `session Session` and delegates
+  (`Observe`/`observeKind`/`BeginTx`/`EndTx`); native-driver integrations
+  (pgx tracers, ...) drive the same exported surface directly. A behavior
+  change in the driver path and in Session is the same change — keep them
+  from diverging (`TestSessionAndDriverPathsAgree` pins the wiring,
+  `FuzzSessionSequence` the counter invariants).
 - If the underlying conn lacks `ExecerContext`/`Execer`, return
   `driver.ErrSkip` **without observing** — database/sql falls back to the
   prepared-statement path, which is also wrapped and will observe.
 - Do not observe on `driver.ErrBadConn` — database/sql retries on a fresh
   conn and the retry observes.
-- `wrappedConn.txID`/`txScope` need no locking (database/sql guarantees
-  single goroutine per driver.Conn); the scope's `openTxs` counter is the
+- `Session.inTx`/`txScope` need no locking (database/sql guarantees single
+  goroutine per driver.Conn, and Session documents the same serial-use
+  contract for native callers); the scope's `openTxs` counter is the
   shared/atomic one.
 - **Closing is idempotent per conn** (`inTx` guard): a textual `COMMIT`
   inside a driver-level tx, double closes, etc. decrement the scope counter

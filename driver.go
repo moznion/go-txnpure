@@ -30,7 +30,7 @@ func (w *wrappedDriver) Open(name string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &wrappedConn{det: w.det, conn: conn}, nil
+	return &wrappedConn{det: w.det, conn: conn, session: Session{det: w.det}}, nil
 }
 
 type wrappedConnector struct {
@@ -43,7 +43,7 @@ func (w *wrappedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &wrappedConn{det: w.det, conn: conn}, nil
+	return &wrappedConn{det: w.det, conn: conn, session: Session{det: w.det}}, nil
 }
 
 func (w *wrappedConnector) Driver() driver.Driver {
@@ -52,14 +52,14 @@ func (w *wrappedConnector) Driver() driver.Driver {
 
 // wrappedConn tracks the transaction lifecycle of one connection and
 // attributes each transaction to the scope carried by the ctx it was begun
-// with. database/sql guarantees a driver.Conn is used by a single goroutine
-// at a time, so inTx/txScope need no locking; the scope counter is the
-// shared/atomic one.
+// with. The tracking itself lives in Session — the same state machine serves
+// native-driver integrations — and database/sql guarantees a driver.Conn is
+// used by a single goroutine at a time, which is exactly the serial-use
+// contract Session requires.
 type wrappedConn struct {
 	det     *Detector
 	conn    driver.Conn
-	inTx    bool   // whether a transaction is open on this connection
-	txScope *scope // scope the open transaction is attributed to (nil = unscoped)
+	session Session
 
 	// wtx is reused for the connection's driver-level transaction: a
 	// driver.Conn hosts at most one at a time and is used by a single
@@ -78,95 +78,6 @@ var (
 	_ driver.Validator          = (*wrappedConn)(nil)
 	_ driver.NamedValueChecker  = (*wrappedConn)(nil)
 )
-
-// openTx marks the connection as inside a transaction attributed to the ctx
-// scope (incrementing its open-transaction counter), or reports an unscoped
-// transaction when the ctx carries no scope.
-func (c *wrappedConn) openTx(ctx context.Context) {
-	c.inTx = true
-	c.txScope = scopeFrom(ctx)
-	if c.txScope != nil {
-		c.txScope.openTxs.Add(1)
-	} else {
-		c.det.reportUnscopedTx(ctx)
-	}
-}
-
-// closeTx ends the connection's transaction, decrementing the scope counter
-// at most once (inTx guard): a textual COMMIT inside a driver-level tx,
-// double closes, etc. must not drive the counter negative.
-func (c *wrappedConn) closeTx() {
-	if !c.inTx {
-		return
-	}
-	c.inTx = false
-	if c.txScope != nil {
-		c.txScope.openTxs.Add(-1)
-		c.txScope = nil
-	}
-}
-
-// observe updates textual transaction state (raw "BEGIN"/"COMMIT" executed as
-// plain statements) as a best effort, and reports a Violation when a write is
-// issued on this connection while a transaction opened on a *different*
-// connection in the same scope is still open (§4.11 of DESIGN.md).
-func (c *wrappedConn) observe(ctx context.Context, query string) {
-	c.observeKind(ctx, query, c.det.classify(query))
-	// User-declared external calls are checked against every open transaction
-	// in the scope (including this connection's own), independently of the
-	// tx-lifecycle/write classification above. The len check is hoisted here
-	// so the common no-checker case pays no function call per statement.
-	if len(c.det.stmtCheckers) != 0 {
-		c.det.runStatementCheckers(ctx, query)
-	}
-}
-
-// observeKind is observe with the classification already known — the prepared
-// statement path classifies once at prepare time and reuses the result for
-// every execution.
-func (c *wrappedConn) observeKind(ctx context.Context, query string, kind StatementKind) {
-	switch kind {
-	case KindBegin:
-		if !c.inTx {
-			c.openTx(ctx)
-		}
-	case KindCommit, KindRollback:
-		c.closeTx()
-	case KindWrite:
-		c.reportIfCrossConn(ctx, query)
-	case KindOther:
-	}
-}
-
-// reportIfCrossConn reports a cross-connection-write Violation when a write on
-// this connection runs alongside a transaction open on another connection in
-// the ctx scope. Each connection is its own transaction boundary, so a write
-// outside the connection that holds a transaction cannot be rolled back with
-// it. The connection's own open transaction is excluded (a write inside its
-// own transaction is normal); only *other* connections' transactions count.
-func (c *wrappedConn) reportIfCrossConn(ctx context.Context, query string) {
-	s, mark := scopeAndMarkFrom(ctx)
-	if s == nil {
-		return
-	}
-	total := s.openTxs.Load()
-	var self int64
-	if c.inTx && c.txScope == s {
-		self = 1
-	}
-	foreign := total - self
-	if foreign <= 0 {
-		// A marked write with no transaction open at all is a stale allow
-		// (§4.14 uniform rule). A write inside its own connection's
-		// transaction stays silent — that execution is normal, not evidence
-		// the mark is stale.
-		if total == 0 && mark != nil {
-			c.det.reportStaleAllow(ctx, StaleAllow{Scope: s.name, Op: Op{Kind: "db", Name: crossConnOpName(query)}, Reason: mark.reason})
-		}
-		return
-	}
-	c.det.decideAndReport(ctx, s, mark, Op{Kind: "db", Name: crossConnOpName(query)}, int(foreign), checkConfig{})
-}
 
 // crossConnOpName derives the op identity of a write statement: the
 // best-effort table name, or "write" when it cannot tell.
@@ -218,7 +129,7 @@ func (c *wrappedConn) Begin() (driver.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.beginDriverTx(context.Background())
+	c.session.BeginTx(context.Background())
 	c.wtx = wrappedTx{conn: c, tx: tx}
 	return &c.wtx, nil
 }
@@ -237,18 +148,12 @@ func (c *wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 	if err != nil {
 		return nil, err
 	}
-	c.beginDriverTx(ctx)
+	// Session.BeginTx closes a textual transaction first, so the scope
+	// counter cannot get stuck high when a driver-level begin follows a raw
+	// "BEGIN" on the same conn.
+	c.session.BeginTx(ctx)
 	c.wtx = wrappedTx{conn: c, tx: tx}
 	return &c.wtx, nil
-}
-
-// beginDriverTx opens the driver-level transaction. If a textual BEGIN
-// already opened one on this conn, close it first so the scope counter does
-// not get stuck high (a permanent false positive is worse than a missed
-// borderline case).
-func (c *wrappedConn) beginDriverTx(ctx context.Context) {
-	c.closeTx()
-	c.openTx(ctx)
 }
 
 func (c *wrappedConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -263,7 +168,7 @@ func (c *wrappedConn) ExecContext(ctx context.Context, query string, args []driv
 		// observed, so observing here would double-count.
 		return nil, err
 	}
-	c.observe(ctx, query)
+	c.session.Observe(ctx, query)
 	return res, err
 }
 
@@ -289,7 +194,7 @@ func (c *wrappedConn) QueryContext(ctx context.Context, query string, args []dri
 	if errors.Is(err, driver.ErrBadConn) {
 		return nil, err
 	}
-	c.observe(ctx, query)
+	c.session.Observe(ctx, query)
 	return rows, err
 }
 
@@ -345,13 +250,13 @@ type wrappedTx struct {
 // stuck high would poison every later checkpoint in the scope.
 func (t *wrappedTx) Commit() error {
 	err := t.tx.Commit()
-	t.conn.closeTx()
+	t.conn.session.EndTx()
 	return err
 }
 
 func (t *wrappedTx) Rollback() error {
 	err := t.tx.Rollback()
-	t.conn.closeTx()
+	t.conn.session.EndTx()
 	return err
 }
 
@@ -367,7 +272,7 @@ type wrappedStmt struct {
 // transaction-lifecycle/write handling uses the prepare-time classification,
 // and prepare-time checker matches are reported against the ctx scope.
 func (s *wrappedStmt) observe(ctx context.Context) {
-	s.conn.observeKind(ctx, s.query, s.kind)
+	s.conn.session.observeKind(ctx, s.query, s.kind)
 	if len(s.stmtOps) != 0 {
 		s.conn.det.reportStatementOps(ctx, s.stmtOps)
 	}
