@@ -124,6 +124,104 @@ func FuzzDriverSequence(f *testing.F) {
 	})
 }
 
+// FuzzSessionSequence drives the exported native-driver surface (Session)
+// with the same invariants as FuzzDriverSequence: whatever the statement and
+// BeginTx/EndTx stream, the scope counter stays in [0, sessions] and drains
+// to zero once every session's transaction is ended. The driver middleware is
+// built on Session, but this target reaches the exported methods directly —
+// including the call orders database/sql can never produce (EndTx with no
+// transaction, BeginTx over a textual transaction, interleaved sessions).
+func FuzzSessionSequence(f *testing.F) {
+	seeds := []struct {
+		ops   []byte
+		query string
+	}{
+		{[]byte{0x20, 0xc0, 0x40}, "SELECT 1"},                       // textual BEGIN, write, COMMIT
+		{[]byte{0x03, 0x06, 0x04}, "SELECT 1"},                       // BeginTx, check, EndTx
+		{[]byte{0x03, 0xc8, 0x04}, "INSERT INTO t VALUES (1)"},       // cross-session write
+		{[]byte{0x20, 0x03, 0x04}, "BEGIN"},                          // BeginTx over a textual tx
+		{[]byte{0x04, 0x04, 0x06}, "COMMIT"},                         // EndTx with nothing open
+		{[]byte{0x20, 0x80, 0xa0, 0x60}, "SAVEPOINT sp1"},            // savepoints keep the tx open
+		{[]byte{0x03, 0x0b, 0x04, 0x0c}, "COMMIT"},                   // BeginTx on both sessions
+		{[]byte{0x07, 0x27, 0x47}, "notify_external('x')"},           // unscoped statements
+		{[]byte{0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa}, "\x00\xff"},     // non-UTF-8 query
+		{[]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, ""}, // every action once
+	}
+	for _, s := range seeds {
+		f.Add(s.ops, s.query)
+	}
+	f.Fuzz(func(t *testing.T, ops []byte, query string) {
+		det := New(
+			WithReporter(NewCollectingReporter()),
+			WithStatementChecker(fuzzStatementChecker),
+			WithUnscopedTxDetection(),
+			WithUnscopedCheckDetection(),
+			WithLeakedTxDetection(),
+			WithStackDepth(4),
+		)
+
+		// Index 0 is the fuzzer's query; the rest keep sequences meaningful
+		// without the fuzzer having to discover SQL keywords by itself.
+		stmts := [8]string{
+			query,
+			"BEGIN",
+			"COMMIT",
+			"ROLLBACK",
+			"SAVEPOINT sp1",
+			"ROLLBACK TO SAVEPOINT sp1",
+			"INSERT INTO t VALUES (1)",
+			"SELECT 1",
+		}
+
+		ctx, finish := det.StartScope(context.Background(), "FuzzSessionScope")
+		defer finish()
+		s := scopeFrom(ctx)
+
+		var sessions [fuzzConns]*Session
+		for i := range sessions {
+			sessions[i] = det.NewSession()
+		}
+
+		// Bound the work per input so fuzzing stays throughput-bound rather
+		// than spending its budget replaying one huge sequence.
+		if len(ops) > 64 {
+			ops = ops[:64]
+		}
+		for _, op := range ops {
+			i := int(op>>3) % fuzzConns
+			sess, q := sessions[i], stmts[op>>5]
+			switch op & 0x7 {
+			case 0, 1, 2:
+				sess.Observe(ctx, q)
+			case 3:
+				sess.BeginTx(ctx)
+			case 4, 5:
+				sess.EndTx()
+			case 6:
+				det.Check(ctx, Op{Kind: "http", Name: "GET api.example.com"})
+			case 7:
+				// The same statement with no scope on its context: sessions
+				// must not leak transaction state across scopes.
+				sess.Observe(context.Background(), q)
+			}
+			if open := s.openTxs.Load(); open < 0 || open > fuzzConns {
+				t.Fatalf("open transaction counter out of range after op %#02x: %d", op, open)
+			}
+		}
+
+		// Drain: EndTx is documented to end whatever transaction the session
+		// holds (textual or BeginTx alike) and to be idempotent, so after
+		// ending every session the counter must be back to zero.
+		for _, sess := range sessions {
+			sess.EndTx()
+			sess.EndTx()
+		}
+		if open := s.openTxs.Load(); open != 0 {
+			t.Fatalf("open transaction counter is %d after draining every session, want 0", open)
+		}
+	})
+}
+
 // FuzzAdversarialClassifier repeats the driver sequence with a classifier that
 // returns arbitrary kinds — including values outside the defined StatementKind
 // range — for arbitrary queries. WithClassifier is a public escape hatch, so a

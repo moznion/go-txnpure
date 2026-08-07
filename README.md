@@ -78,7 +78,8 @@ StartScope(ctx)  ───► *scope in ctx
    transactions (driver-level `BeginTx` and textual `BEGIN`/`COMMIT` alike)
    and attribute each one to the scope on its context. Works with anything on
    top of `database/sql` — sqlx, GORM, ent, pgx via `stdlib` — no per-ORM
-   adapters.
+   adapters. Connections that bypass `database/sql` (native pgx, ...) feed
+   the same state machine through `Session` (see "Native drivers" below).
 3. **Checkpoints**: instrumented side-effect clients call `Check` (or use
    `WrapRoundTripper` / `Do`). If the scope has an open transaction, a
    `Violation` is reported immediately, with a stack trace. The side effect
@@ -186,6 +187,53 @@ For non-HTTP side effects, instrument the call site with `Check` or `Do`:
 err := detector.Do(ctx, txnpure.Op{Kind: "enqueue", Name: "sqs:SendMessage"},
 	func(ctx context.Context) error { return queue.Send(ctx, msg) })
 ```
+
+### Native drivers (pgx, …)
+
+Connections that do not go through `database/sql` have no driver to wrap.
+`Session` is the same transaction-attribution state machine the driver
+wrapper is built on, exported for those integrations: create one Session per
+connection, feed it every executed statement with the context that carried
+it, and bracket protocol-level transactions that never surface as statement
+text with `BeginTx`/`EndTx`.
+
+With native pgx, a tracer is the natural feed — pgx's `Begin()`/`Commit()`
+execute textual `begin`/`commit`, so `Observe` tracks them from the text
+alone, and a batch (one implicit transaction server-side) is bracketed by
+hand:
+
+```go
+type txnpureTracer struct {
+	det           *txnpure.Detector
+	mu            sync.Mutex
+	sessions      map[*pgx.Conn]*txnpure.Session
+	implicitBatch map[*pgx.Conn]bool
+}
+
+func (t *txnpureTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	t.sessionFor(conn).Observe(ctx, data.SQL) // textual BEGIN/COMMIT tracked here
+	return ctx
+}
+
+func (t *txnpureTracer) TraceBatchStart(ctx context.Context, conn *pgx.Conn, _ pgx.TraceBatchStartData) context.Context {
+	if conn.PgConn().TxStatus() == 'I' { // idle: the batch runs as one implicit tx
+		t.sessionFor(conn).BeginTx(ctx)
+		t.markImplicitBatch(conn) // a batch inside an explicit tx belongs to that tx: bracket only this one
+	}
+	return ctx
+}
+
+func (t *txnpureTracer) TraceBatchEnd(_ context.Context, conn *pgx.Conn, _ pgx.TraceBatchEndData) {
+	if t.unmarkImplicitBatch(conn) {
+		t.sessionFor(conn).EndTx()
+	}
+}
+```
+
+Call `EndTx` when a connection is torn down, too — it is idempotent, and a
+dropped connection must not leave the scope counter stuck high. Everything
+else (checkpoints, cross-connection writes, statement checkers, governance)
+behaves exactly as with the wrapped driver, because it is the same machine.
 
 ### Declaring your own external calls
 
