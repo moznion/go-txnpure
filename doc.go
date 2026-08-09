@@ -24,6 +24,10 @@
 //     the scope's open-transaction counter on BeginTx (and textual BEGIN) and
 //     decrementing it on Commit/Rollback. This works with anything on top of
 //     database/sql — sqlx, GORM, ent, pgx via stdlib — with no per-ORM adapter.
+//     Connections that bypass database/sql (native pgx, ...) feed the same
+//     state machine through Session: one Session per connection, Observe per
+//     statement (e.g. from a pgx tracer), BeginTx/EndTx for transitions that
+//     never surface as statement text.
 //   - Checkpoints: instrumented side-effect clients consult the scope. If a
 //     transaction is open, a Violation is reported immediately, with a stack
 //     trace. The side effect itself is never blocked — txnpure observes and

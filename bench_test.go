@@ -41,34 +41,34 @@ func BenchmarkObserve(b *testing.B) {
 	defer finish()
 
 	b.Run("select_no_scope", func(b *testing.B) {
-		conn := &wrappedConn{det: det, conn: nullConn{}}
+		conn := &wrappedConn{det: det, conn: nullConn{}, session: Session{det: det}}
 		ctx := context.Background()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			conn.observe(ctx, "select id from users where id = $1")
+			conn.session.Observe(ctx, "select id from users where id = $1")
 		}
 	})
 	b.Run("select_in_scope", func(b *testing.B) {
-		conn := &wrappedConn{det: det, conn: nullConn{}}
+		conn := &wrappedConn{det: det, conn: nullConn{}, session: Session{det: det}}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			conn.observe(scoped, "select id from users where id = $1")
+			conn.session.Observe(scoped, "select id from users where id = $1")
 		}
 	})
 	b.Run("write_in_scope_no_tx", func(b *testing.B) {
-		conn := &wrappedConn{det: det, conn: nullConn{}}
+		conn := &wrappedConn{det: det, conn: nullConn{}, session: Session{det: det}}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			conn.observe(scoped, "update users set name = $1 where id = $2")
+			conn.session.Observe(scoped, "update users set name = $1 where id = $2")
 		}
 	})
 	b.Run("write_in_scope_own_tx", func(b *testing.B) {
-		conn := &wrappedConn{det: det, conn: nullConn{}}
-		conn.openTx(scoped)
-		defer conn.closeTx()
+		conn := &wrappedConn{det: det, conn: nullConn{}, session: Session{det: det}}
+		conn.session.openTx(scoped)
+		defer conn.session.closeTx()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			conn.observe(scoped, "update users set name = $1 where id = $2")
+			conn.session.Observe(scoped, "update users set name = $1 where id = $2")
 		}
 	})
 }
