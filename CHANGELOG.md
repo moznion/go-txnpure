@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.2.0](https://github.com/moznion/go-txnpure/compare/v0.1.0...v0.2.0) - 2026-08-09
+
+- Export the transaction state machine as Session for native-driver integrations by @moznion in https://github.com/moznion/go-txnpure/pull/9
+
 ## [v0.1.0](https://github.com/moznion/go-txnpure/compare/v0.0.1...v0.1.0) - 2026-08-05
 
 - Add at-the-effect-site allows (`AllowInTransactionHere`) and exact in-transaction call counts on every allow form by @moznion in https://github.com/moznion/go-txnpure/pull/6
